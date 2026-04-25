@@ -15,7 +15,6 @@ effectively monochrome — most DJ jobs (full-color logos) stay in color.
 """
 from __future__ import annotations
 
-import io
 import logging
 
 import cv2
@@ -26,7 +25,6 @@ log = logging.getLogger(__name__)
 
 _CONTRAST_FACTOR = 1.5
 _SHARPEN_PASSES = 2
-_JPEG_QUALITY = 95
 
 # If the mean saturation of non-near-black pixels is below this (0..255),
 # treat the logo as effectively monochrome and collapse to grayscale before
@@ -136,10 +134,12 @@ def _denoise_core(image: Image.Image) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(denoised_bgr, cv2.COLOR_BGR2RGB), mode="RGB")
 
 
-def clean_image(jpeg_bytes: bytes) -> bytes:
-    """Run the full pre-vectorization cleanup pipeline and return JPEG bytes."""
-    image = Image.open(io.BytesIO(jpeg_bytes))
-    image.load()
+def clean_image(image: Image.Image) -> Image.Image:
+    """Run the full pre-vectorization cleanup pipeline.
+
+    Takes and returns an in-memory PIL.Image — no JPEG round-trip. Caller
+    should pass through to vectorize.vectorize via intake.encode_jpeg().
+    """
     if image.mode != "RGB":
         image = image.convert("RGB")
 
@@ -164,21 +164,4 @@ def clean_image(jpeg_bytes: bytes) -> bytes:
     for _ in range(_SHARPEN_PASSES):
         image = image.filter(ImageFilter.SHARPEN)
 
-    # Vectorizer.ai accepts JPEG regardless of mode; but ensure we save as JPEG.
-    if image.mode == "L":
-        # JPEG will save an L-mode image as grayscale JPEG — preferred over RGB
-        # for genuinely monochrome logos so the vectorizer sees one channel.
-        save_kwargs = {"format": "JPEG", "quality": _JPEG_QUALITY, "optimize": True}
-    else:
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        save_kwargs = {
-            "format": "JPEG",
-            "quality": _JPEG_QUALITY,
-            "optimize": True,
-            "subsampling": 0,
-        }
-
-    buffer = io.BytesIO()
-    image.save(buffer, **save_kwargs)
-    return buffer.getvalue()
+    return image

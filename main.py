@@ -1,11 +1,15 @@
 """DJ's Art Engine — FastAPI application entry point."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import secrets
+import shutil
+import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -40,6 +44,9 @@ _ACCEPTED_UPLOAD_MESSAGE = "Please upload a JPEG, PNG, HEIC, WebP, BMP, or PDF"
 # Paths exempt from basic-auth (Render health checks must succeed unauthenticated).
 _AUTH_EXEMPT_PATHS = ("/health",)
 _BASIC_REALM = 'Basic realm="DJ Art Engine"'
+_SUPPORT_PHONE = "+1 (603) 555-0000"
+_ORPHAN_AGE_SECONDS = 24 * 3600
+_PDF_THREAD_POOL_SIZE = 4
 
 
 class BasicAuthMiddleware(BaseHTTPMiddleware):
@@ -92,6 +99,36 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(BasicAuthMiddleware)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.on_event("startup")
+def _purge_orphan_jobs() -> None:
+    """Delete any job folders in TEMP_DIR older than 24h.
+
+    Render's filesystem is ephemeral so this is a no-op there, but on long-
+    running local dev a crashed mid-job leaks a per-job folder. Cheap pass
+    on every startup keeps disk usage bounded.
+    """
+    try:
+        temp_root = config.get_temp_dir()
+    except Exception as exc:
+        log.warning("Skipping orphan cleanup — temp dir unavailable: %s", exc)
+        return
+
+    now = time.time()
+    purged = 0
+    for entry in temp_root.iterdir() if temp_root.exists() else []:
+        if not entry.is_dir():
+            continue
+        try:
+            age = now - entry.stat().st_mtime
+        except OSError:
+            continue
+        if age > _ORPHAN_AGE_SECONDS:
+            shutil.rmtree(entry, ignore_errors=True)
+            purged += 1
+    if purged:
+        log.info("Startup orphan cleanup: removed %s stale job dirs from %s.", purged, temp_root)
 
 
 @app.get("/")
@@ -148,9 +185,9 @@ async def process(
              job_id, file.filename, len(raw_bytes), job_name)
 
     try:
-        # --- Intake: any supported format -> clean JPEG ----------------------
+        # --- Intake: decode any supported format -> in-memory PIL.Image ------
         try:
-            jpeg_bytes = intake.to_jpeg(
+            intake_result = intake.decode(
                 raw_bytes,
                 filename=file.filename,
                 content_type=content_type,
@@ -159,17 +196,22 @@ async def process(
             log.warning("Job %s intake failure: %s", job_id, exc)
             package.cleanup(job_dir)
             raise HTTPException(status_code=exc.status, detail=exc.message) from exc
-        (job_dir / "intake.jpg").write_bytes(jpeg_bytes)
 
-        # --- Pre-vectorization cleanup ---------------------------------------
-        cleaned_bytes = cleanup.clean_image(jpeg_bytes)
-        (job_dir / "cleaned.jpg").write_bytes(cleaned_bytes)
+        # --- Pre-vectorization cleanup (PIL.Image -> PIL.Image, no JPEG hop)--
+        cleaned_image = cleanup.clean_image(intake_result.image)
+        # Persist the cleaned image as PNG for debugging — lossless and matches
+        # exactly what we send to Vectorizer.ai (after the single JPEG encode).
+        cleaned_image.save(job_dir / "cleaned.png", format="PNG", optimize=True)
+
+        # --- Encode JPEG ONCE, immediately before the API call ---------------
+        jpeg_bytes = intake.encode_jpeg(cleaned_image)
+        (job_dir / "vectorize_input.jpg").write_bytes(jpeg_bytes)
 
         # --- Vectorize --------------------------------------------------------
         try:
             svg_bytes = await vectorize.vectorize(
-                cleaned_bytes,
-                filename="cleaned.jpg",
+                jpeg_bytes,
+                filename="vectorize_input.jpg",
                 content_type="image/jpeg",
             )
         except VectorizerError as exc:
@@ -184,7 +226,6 @@ async def process(
                 },
             )
 
-        # Persist a copy of the SVG for debugging (cleaned up with job_dir).
         (job_dir / "vectorized.svg").write_bytes(svg_bytes)
 
         # --- Separate colors --------------------------------------------------
@@ -200,14 +241,17 @@ async def process(
 
         layers = separation.layers
         log.info(
-            "Job %s colors=%s only_one=%s complex=%s",
-            job_id, len(layers), separation.only_one_color, separation.complex_design,
+            "Job %s colors=%s only_one=%s complex=%s gradients=%s stroke_only=%s multipage=%s",
+            job_id, len(layers),
+            separation.only_one_color, separation.complex_design,
+            separation.gradients_detected, separation.stroke_only_fallback,
+            intake_result.multipage_pdf,
         )
 
-        # --- Render per-color PDFs -------------------------------------------
+        # --- Render per-color PDFs in parallel -------------------------------
         dpi = config.get_output_dpi()
-        color_pdfs: list[tuple[separate.ColorLayer, Path]] = []
-        for layer in layers:
+
+        def _render_one(layer: separate.ColorLayer) -> tuple[separate.ColorLayer, Path]:
             pdf_path = job_dir / package.pdf_filename(layer)
             render_separation_pdf(
                 svg_bytes=svg_bytes,
@@ -216,7 +260,18 @@ async def process(
                 dpi=dpi,
                 bleed_inches=0.125,
             )
-            color_pdfs.append((layer, pdf_path))
+            return layer, pdf_path
+
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=_PDF_THREAD_POOL_SIZE) as pool:
+            color_pdfs = list(
+                await asyncio.gather(
+                    *(loop.run_in_executor(pool, _render_one, layer) for layer in layers)
+                )
+            )
+        # Preserve coverage-sorted order from `layers`.
+        order_index = {layer.hex: i for i, layer in enumerate(layers)}
+        color_pdfs.sort(key=lambda entry: order_index[entry[0].hex])
 
         # --- Package ZIP ------------------------------------------------------
         zip_path = package.build_zip(job_dir=job_dir, color_pdfs=color_pdfs, job_name=job_name)
@@ -235,6 +290,8 @@ async def process(
             headers["X-Warning-Gradients"] = "1"
         if separation.stroke_only_fallback:
             headers["X-Warning-StrokeOnly"] = "1"
+        if intake_result.multipage_pdf:
+            headers["X-Warning-MultiPage"] = "1"
 
         return FileResponse(
             path=str(zip_path),
@@ -253,7 +310,7 @@ async def process(
         return JSONResponse(
             status_code=500,
             content={
-                "error": "Something went wrong — text Anthony.",
+                "error": f"Something went wrong — text Anthony at {_SUPPORT_PHONE}.",
                 "photopea_url": PHOTOPEA_FALLBACK_URL,
             },
         )

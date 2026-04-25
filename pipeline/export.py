@@ -221,8 +221,6 @@ def rasterize_svg_to_pil(svg_bytes: bytes, dpi: int) -> Image.Image:
     drawing = svg2rlg(io.BytesIO(svg_bytes))
     if drawing is None:
         raise RuntimeError("svglib failed to parse the SVG.")
-    # renderPM returns a PIL Image when fmt='PIL' and writes to a buffer otherwise.
-    # drawToString with fmt='PNG' is the most reliable path.
     png_bytes = renderPM.drawToString(drawing, fmt="PNG", dpi=dpi)
     return Image.open(io.BytesIO(png_bytes))
 

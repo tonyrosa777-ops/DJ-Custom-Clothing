@@ -255,11 +255,7 @@ def _compute_coverage(parsed_root, color_hexes: list[str]) -> dict[str, float]:
 
 
 def _walk_colors(root) -> tuple[dict[str, int], dict[str, int], bool]:
-    """Walk the SVG and collect:
-        - fill_counts: {hex: occurrence count}
-        - stroke_counts: {hex: occurrence count}
-        - gradients_detected: True if any element uses a url(#...) paint
-    """
+    """Walk the SVG once and collect fill/stroke counts plus gradient flag."""
     fill_counts: dict[str, int] = {}
     stroke_counts: dict[str, int] = {}
     gradients_detected = False
