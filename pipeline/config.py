@@ -30,6 +30,17 @@ def get_basic_auth() -> tuple[str, str]:
     return _env("DJ_BASIC_USER"), _env("DJ_BASIC_PASS")
 
 
+def get_vectorizer_mode() -> str:
+    """Return Vectorizer.ai mode: 'production' (default), 'preview', or 'test'.
+
+    'test' is free but watermarks the output. Use during dev when the API key
+    doesn't yet have a paid production-mode subscription. Set in .env via
+    VECTORIZER_MODE=test.
+    """
+    raw = _env("VECTORIZER_MODE").lower()
+    return raw if raw in ("production", "preview", "test") else "production"
+
+
 def get_max_file_mb() -> int:
     raw = _env("MAX_FILE_SIZE_MB")
     if not raw:

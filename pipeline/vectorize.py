@@ -80,7 +80,10 @@ async def vectorize(image_bytes: bytes, filename: str, content_type: str) -> byt
         )
 
     files = {"image": (filename, image_bytes, content_type or "application/octet-stream")}
-    data = {"mode": "production", "output.file_format": "svg"}
+    mode = config.get_vectorizer_mode()
+    data = {"mode": mode, "output.file_format": "svg"}
+    if mode != "production":
+        log.info("Vectorizer.ai mode=%s (set VECTORIZER_MODE=production for clean output).", mode)
 
     last_error_message = "unknown error"
     for attempt in range(1, _MAX_ATTEMPTS + 1):
