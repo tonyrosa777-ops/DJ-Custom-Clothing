@@ -25,6 +25,11 @@ def get_api_credentials() -> tuple[str, str]:
     return _env("VECTORIZER_API_ID"), _env("VECTORIZER_API_TOKEN")
 
 
+def get_basic_auth() -> tuple[str, str]:
+    """Return (user, password) for basic-auth gate. Empty strings = auth disabled."""
+    return _env("DJ_BASIC_USER"), _env("DJ_BASIC_PASS")
+
+
 def get_max_file_mb() -> int:
     raw = _env("MAX_FILE_SIZE_MB")
     if not raw:

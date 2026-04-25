@@ -10,7 +10,9 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+import numpy as np
 from lxml import etree
+from svgpathtools import parse_path
 
 from pipeline import color_math
 from pipeline.color_math import (
@@ -25,6 +27,7 @@ log = logging.getLogger(__name__)
 
 _DEDUPE_THRESHOLD = 10.0
 _COVERAGE_DPI = 72
+_BACKGROUND_COVERAGE_RATIO = 0.98  # bbox area / viewBox area required to call something "background"
 _STYLE_FILL_RE = re.compile(r"fill\s*:\s*(#[0-9a-fA-F]{3,6}|none|[a-zA-Z]+)")
 _SVG_NS = "http://www.w3.org/2000/svg"
 
@@ -78,8 +81,56 @@ def _iter_colored_elements(root):
             yield element, fill
 
 
+def _bbox_for_element(element) -> tuple[float, float, float, float] | None:
+    """Return (x, y, w, h) bbox in user units for rect/path/polygon. None if unparseable."""
+    if not isinstance(element.tag, str):
+        return None
+    tag = etree.QName(element).localname
+
+    if tag == "rect":
+        try:
+            x = float(element.get("x", "0"))
+            y = float(element.get("y", "0"))
+            w = float(element.get("width", "0"))
+            h = float(element.get("height", "0"))
+        except ValueError:
+            return None
+        return x, y, w, h
+
+    if tag == "path":
+        d = element.get("d")
+        if not d:
+            return None
+        try:
+            path_obj = parse_path(d)
+            if not path_obj or len(path_obj) == 0:
+                return None
+            xmin, xmax, ymin, ymax = path_obj.bbox()
+        except Exception:
+            return None
+        return xmin, ymin, xmax - xmin, ymax - ymin
+
+    if tag in ("polygon", "polyline"):
+        points = element.get("points", "")
+        coords = [float(n) for n in re.findall(r"[-+]?\d*\.?\d+", points)]
+        if len(coords) < 4:
+            return None
+        xs = coords[0::2]
+        ys = coords[1::2]
+        return min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)
+
+    return None
+
+
 def _detect_background(root) -> str | None:
-    """Detect a whole-canvas background rect/path. Return its normalized hex or None."""
+    """Detect a whole-canvas background — the bottom-most rendered shape that
+    fills ≥98% of the viewBox by bounding-box area.
+
+    Vectorizer.ai sometimes emits backgrounds as <rect>, sometimes as <path>
+    (typically the first filled element in document order, possibly nested in
+    a <g>). We walk the tree in document order and return the first filled
+    element whose bbox spans the full canvas.
+    """
     viewbox = root.get("viewBox")
     if not viewbox:
         return None
@@ -90,19 +141,29 @@ def _detect_background(root) -> str | None:
         _, _, vb_w, vb_h = (float(p) for p in parts)
     except ValueError:
         return None
+    if vb_w <= 0 or vb_h <= 0:
+        return None
+    viewbox_area = vb_w * vb_h
 
-    # Look at the first few children of <svg> for a full-canvas rect.
-    for child in root:
-        tag = etree.QName(child).localname if isinstance(child.tag, str) else None
-        if tag != "rect":
+    for element in root.iter():
+        if not isinstance(element.tag, str):
             continue
-        try:
-            w = float(child.get("width", "0"))
-            h = float(child.get("height", "0"))
-        except ValueError:
+        tag = etree.QName(element).localname
+        if tag not in ("rect", "path", "polygon"):
             continue
-        if w >= vb_w * 0.98 and h >= vb_h * 0.98:
-            return _extract_fill(child)
+        fill = _extract_fill(element)
+        if fill is None:
+            continue
+        bbox = _bbox_for_element(element)
+        if bbox is None:
+            continue
+        _, _, bw, bh = bbox
+        if bw <= 0 or bh <= 0:
+            continue
+        if (bw * bh) >= _BACKGROUND_COVERAGE_RATIO * viewbox_area:
+            log.info("Background detected: %s (%s, bbox=%.1fx%.1f vb=%.1fx%.1f)",
+                     fill, tag, bw, bh, vb_w, vb_h)
+            return fill
     return None
 
 
@@ -144,9 +205,9 @@ def _compute_coverage(svg_bytes: bytes, color_hexes: list[str]) -> dict[str, flo
             mutated = mutate_svg_for_color(svg_bytes, hex_value, bleed_inches=0.0)
             image = rasterize_svg_to_pil(mutated, dpi=_COVERAGE_DPI)
             gray = image.convert("L")
-            pixels = list(gray.getdata())
-            total = len(pixels) or 1
-            black_count = sum(1 for p in pixels if p < 128)
+            arr = np.asarray(gray)
+            total = arr.size or 1
+            black_count = int(np.count_nonzero(arr < 128))
             coverage[hex_value] = black_count / total
         except Exception as exc:  # pragma: no cover — coverage is best-effort
             log.warning("Coverage render failed for %s: %s", hex_value, exc)

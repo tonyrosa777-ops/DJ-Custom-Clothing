@@ -30,9 +30,9 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
     ".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".bmp", ".pdf",
 })
 
-_PDF_RENDER_DPI = 300
+_PDF_RENDER_DPI = 150  # Vectorizer.ai doesn't need 300 DPI input — saves memory + time.
 _JPEG_QUALITY = 95
-_MAX_DIMENSION = 8000  # Downscale absurdly large inputs to keep pipeline snappy.
+_MAX_DIMENSION = 3000  # Cap raw input to bound RAM (Render free tier = 512 MB).
 
 
 @dataclass

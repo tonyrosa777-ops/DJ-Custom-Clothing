@@ -3,10 +3,12 @@
 Pipeline (applied in this order to a clean RGB JPEG from intake):
 
   1. Saturation analysis -> decide grayscale vs keep-color
-  2. Contrast enhancement (PIL ImageEnhance.Contrast, factor 1.5)
-  3. Sharpening (PIL ImageFilter.SHARPEN, two passes)
-  4. Noise reduction (OpenCV fastNlMeansDenoising, single- or 3-channel variant)
-  5. Auto-levels (stretch histogram to full 0-255 range via ImageOps.autocontrast)
+  2. Noise reduction (OpenCV fastNlMeansDenoising) — FIRST so we don't
+     amplify compression artifacts in later steps
+  3. Auto-levels (ImageOps.autocontrast) — set the tonal range cleanly
+  4. Contrast enhancement (PIL ImageEnhance.Contrast, factor 1.5)
+  5. Sharpening (PIL ImageFilter.SHARPEN, two passes) — LAST so sharpening
+     adds crispness to a clean image rather than amplifying noise
 
 Only collapses to grayscale if saturation analysis confirms the logo is
 effectively monochrome — most DJ jobs (full-color logos) stay in color.
@@ -117,18 +119,18 @@ def clean_image(jpeg_bytes: bytes) -> bytes:
     else:
         log.info("Cleanup: image classified as color, keeping RGB.")
 
-    # 2. Contrast enhancement.
-    image = ImageEnhance.Contrast(image).enhance(_CONTRAST_FACTOR)
-
-    # 3. Sharpening — two passes.
-    for _ in range(_SHARPEN_PASSES):
-        image = image.filter(ImageFilter.SHARPEN)
-
-    # 4. Noise reduction.
+    # 2. Noise reduction FIRST (before anything that amplifies high-frequency content).
     image = _denoise(image)
 
-    # 5. Auto-levels — stretch histogram to full 0-255 range.
+    # 3. Auto-levels — stretch histogram to full 0-255 range on the clean image.
     image = ImageOps.autocontrast(image, cutoff=0)
+
+    # 4. Contrast enhancement.
+    image = ImageEnhance.Contrast(image).enhance(_CONTRAST_FACTOR)
+
+    # 5. Sharpening LAST — two passes.
+    for _ in range(_SHARPEN_PASSES):
+        image = image.filter(ImageFilter.SHARPEN)
 
     # Vectorizer.ai accepts JPEG regardless of mode; but ensure we save as JPEG.
     if image.mode == "L":
