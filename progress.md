@@ -68,6 +68,65 @@
 
 ---
 
+## Go-Live Verification Checklist
+
+Walk through this against the live Render URL before handing the tool to DJ. Each item maps to a behavior already implemented in the codebase.
+
+### Deploy plumbing
+- [ ] Render build succeeds (no pip install errors in build log)
+- [ ] `VECTORIZER_API_ID` and `VECTORIZER_API_TOKEN` set in Render dashboard env vars
+- [ ] `https://<render-url>/health` returns `{"status":"ok"}`
+- [ ] `https://<render-url>/` serves the HTML frontend (drag-drop visible)
+- [ ] Static CSS/JS load (page is styled, dropzone interactive)
+
+### Intake (all 6 formats accepted)
+- [ ] JPEG upload processes successfully
+- [ ] PNG upload processes successfully
+- [ ] HEIC upload (from iPhone) processes successfully
+- [ ] WebP upload processes successfully
+- [ ] BMP upload processes successfully
+- [ ] PDF upload (single-page logo PDF) processes successfully
+
+### Cleanup stage
+- [ ] A full-color logo stays in color (check uvicorn log: `classified as color`)
+- [ ] A black-on-white logo collapses to grayscale (check log: `classified as monochrome`)
+
+### Color separation
+- [ ] Simple 2-color logo → exactly 2 PDFs in ZIP
+- [ ] Prime Butcher (Denny Mike's) → correct 4 colors (Red/Green/Blue/White_INK if dark bg)
+- [ ] White-on-dark logo → `White_INK_FFFFFF.pdf` appears as a separation layer
+- [ ] Logo on white background → white is NOT in the separation list
+- [ ] Complex logo (>10 colors) → `X-Warning-Complex-Design: 1` header present
+- [ ] Single-color logo → `X-Warning-Only-One-Color: 1` header present
+
+### Output PDFs (open each in Chrome's PDF viewer)
+- [ ] All PDFs are grayscale (not color)
+- [ ] Ink areas render black, everything else pure white (no inverted film)
+- [ ] Page size = original artwork dimensions + 0.25" total on each axis (0.125" bleed each side)
+- [ ] PDFs print at 300 DPI from Windows print dialog on Artisan 1430
+- [ ] Filenames follow `{ColorName}_{HEX}.pdf` pattern (e.g. `Red_CC2222.pdf`)
+- [ ] ZIP contains `color_summary.txt` with name/hex/coverage per color
+
+### Error paths
+- [ ] Upload a `.txt` → red banner "Please upload a JPEG, PNG, HEIC, WebP, BMP, or PDF"
+- [ ] Upload a 30 MB file → red banner "File must be under 20MB"
+- [ ] Temporarily set bad Vectorizer creds → red banner with Photopea fallback link visible and clickable
+
+### Temp hygiene
+- [ ] Per-job dir under `TEMP_DIR` is deleted after the ZIP finishes downloading
+  (Render's filesystem is ephemeral, but this confirms `BackgroundTask(package.cleanup, ...)` fires)
+
+### Performance
+- [ ] Typical logo completes upload → download in under 60 seconds
+- [ ] Vectorizer.ai step is the slowest phase (expected — 10–30s)
+
+### DJ handoff
+- [ ] DJ prints one separation PDF on his Artisan 1430 to transparency film
+- [ ] Burned screen from that film exposes cleanly (no pinholes, no grayscale bleed)
+- [ ] DJ completes one real customer job end-to-end with zero help from Anthony
+
+---
+
 ## Current Blockers
 
 None — ready to build.
