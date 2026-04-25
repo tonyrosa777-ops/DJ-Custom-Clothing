@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DJ's Art Engine</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --panel-border: #242832;
+      --text: #e8eaee;
+      --text-dim: #8b92a0;
+      --accent: #ff7a1a;
+      --accent-hover: #ff9147;
+      --accent-disabled: #4a3c2e;
+      --danger: #ff4b4b;
+      --danger-bg: #2a1414;
+      --warning: #f7c948;
+      --warning-bg: #2a2314;
+      --success: #2ecc71;
+      --radius: 10px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 24px 16px;
+    }
+    main {
+      width: 100%;
+      max-width: 720px;
+    }
+    header {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+    h1 {
+      font-size: 28px;
+      margin: 0 0 6px;
+      letter-spacing: -0.5px;
+    }
+    header .subtitle {
+      color: var(--text-dim);
+      font-size: 14px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin-bottom: 16px;
+    }
+
+    .dropzone {
+      border: 2px dashed var(--panel-border);
+      border-radius: var(--radius);
+      padding: 40px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .dropzone:hover,
+    .dropzone.drag-active {
+      border-color: var(--accent);
+      background: rgba(255, 122, 26, 0.05);
+    }
+    .dropzone p { margin: 6px 0; color: var(--text-dim); font-size: 14px; }
+    .dropzone p.primary { color: var(--text); font-size: 16px; margin-bottom: 10px; }
+    .dropzone input { display: none; }
+
+    .file-preview {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 16px;
+      padding: 12px;
+      background: rgba(255, 255, 255, 0.02);
+      border-radius: 8px;
+      border: 1px solid var(--panel-border);
+    }
+    .file-preview img {
+      width: 56px; height: 56px;
+      object-fit: cover;
+      border-radius: 6px;
+      background: #000;
+    }
+    .file-preview .meta { flex: 1; min-width: 0; }
+    .file-preview .name {
+      font-size: 14px; font-weight: 500;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .file-preview .size { color: var(--text-dim); font-size: 12px; }
+    .file-preview .clear {
+      background: none; border: none; color: var(--text-dim);
+      cursor: pointer; font-size: 20px; padding: 0 8px;
+    }
+    .file-preview .clear:hover { color: var(--danger); }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 16px;
+    }
+    label { font-size: 13px; color: var(--text-dim); }
+    input[type="text"] {
+      background: #0f1218;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 14px;
+      padding: 10px 12px;
+      font-family: inherit;
+    }
+    input[type="text"]:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    button.primary {
+      width: 100%;
+      padding: 14px;
+      background: var(--accent);
+      color: #111;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 16px;
+      transition: background 0.15s;
+    }
+    button.primary:hover:not(:disabled) { background: var(--accent-hover); }
+    button.primary:disabled {
+      background: var(--accent-disabled);
+      color: #8b7a5a;
+      cursor: not-allowed;
+    }
+
+    .progress-panel { display: none; }
+    .progress-panel.active { display: block; }
+    .stepper {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .step {
+      flex: 1;
+      height: 6px;
+      background: #252935;
+      border-radius: 3px;
+      overflow: hidden;
+      position: relative;
+    }
+    .step.active::after {
+      content: '';
+      position: absolute; inset: 0;
+      background: var(--accent);
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+    .step.done { background: var(--accent); }
+    .step-labels {
+      display: flex;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+    .step-labels span { flex: 1; text-align: center; }
+    .step-labels span.active { color: var(--text); font-weight: 500; }
+    @keyframes pulse {
+      0%, 100% { opacity: 0.4; }
+      50% { opacity: 1; }
+    }
+
+    .result-panel { display: none; }
+    .result-panel.active { display: block; }
+    .color-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+      gap: 12px;
+      margin: 16px 0;
+    }
+    .color-chip {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      padding: 12px 8px;
+      text-align: center;
+    }
+    .color-chip .swatch {
+      width: 100%;
+      padding-top: 70%;
+      border-radius: 6px;
+      margin-bottom: 8px;
+      border: 1px solid rgba(255,255,255,0.1);
+    }
+    .color-chip .name {
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .color-chip .hex {
+      font-size: 11px;
+      color: var(--text-dim);
+      font-family: "SF Mono", Monaco, Consolas, monospace;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      background: rgba(255, 122, 26, 0.15);
+      color: var(--accent);
+    }
+
+    .banner {
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-bottom: 16px;
+      font-size: 14px;
+      line-height: 1.4;
+      display: none;
+    }
+    .banner.active { display: block; }
+    .banner.warning { background: var(--warning-bg); border: 1px solid var(--warning); color: var(--warning); }
+    .banner.error { background: var(--danger-bg); border: 1px solid var(--danger); color: var(--danger); }
+    .banner a { color: inherit; font-weight: 600; }
+
+    footer {
+      text-align: center;
+      font-size: 12px;
+      color: var(--text-dim);
+      margin-top: 24px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>DJ's Art Engine</h1>
+      <div class="subtitle">Upload a logo → get print-ready transparency films</div>
+    </header>
+
+    <div id="errorBanner" class="banner error"></div>
+    <div id="warningBanner" class="banner warning"></div>
+
+    <section id="uploadPanel" class="panel">
+      <div id="dropzone" class="dropzone" tabindex="0">
+        <p class="primary">Drop a logo here</p>
+        <p>JPEG, PNG, HEIC, WebP, BMP, or PDF &middot; or click to browse</p>
+        <input id="fileInput" type="file" accept="image/jpeg,image/png,image/heic,image/heif,image/webp,image/bmp,application/pdf,.jpg,.jpeg,.png,.heic,.heif,.webp,.bmp,.pdf" />
+      </div>
+      <div id="filePreview" class="file-preview" style="display:none;">
+        <img id="previewImg" alt="preview" />
+        <div class="meta">
+          <div id="previewName" class="name"></div>
+          <div id="previewSize" class="size"></div>
+        </div>
+        <button id="clearBtn" class="clear" aria-label="Remove">&times;</button>
+      </div>
+
+      <div class="field">
+        <label for="jobName">Job name (optional)</label>
+        <input type="text" id="jobName" placeholder="e.g. Prime Butcher — Denny Mike's" />
+      </div>
+
+      <button id="processBtn" class="primary" disabled>Process</button>
+    </section>
+
+    <section id="progressPanel" class="panel progress-panel">
+      <div class="stepper">
+        <div class="step" id="step-upload"></div>
+        <div class="step" id="step-vectorize"></div>
+        <div class="step" id="step-separate"></div>
+        <div class="step" id="step-ready"></div>
+      </div>
+      <div class="step-labels">
+        <span id="label-upload">Uploading</span>
+        <span id="label-vectorize">Vectorizing</span>
+        <span id="label-separate">Separating Colors</span>
+        <span id="label-ready">Ready</span>
+      </div>
+    </section>
+
+    <section id="resultPanel" class="panel result-panel">
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+        <div style="font-size:15px; font-weight:600;">Separation complete</div>
+        <span id="colorBadge" class="badge">0 colors</span>
+      </div>
+      <div id="colorGrid" class="color-grid"></div>
+      <button id="downloadBtn" class="primary">Download ZIP</button>
+    </section>
+
+    <footer>Built by Optimus Business Solutions</footer>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const dropzone = $("dropzone");
+    const fileInput = $("fileInput");
+    const filePreview = $("filePreview");
+    const previewImg = $("previewImg");
+    const previewName = $("previewName");
+    const previewSize = $("previewSize");
+    const clearBtn = $("clearBtn");
+    const jobName = $("jobName");
+    const processBtn = $("processBtn");
+    const progressPanel = $("progressPanel");
+    const resultPanel = $("resultPanel");
+    const colorGrid = $("colorGrid");
+    const colorBadge = $("colorBadge");
+    const downloadBtn = $("downloadBtn");
+    const errorBanner = $("errorBanner");
+    const warningBanner = $("warningBanner");
+
+    const MAX_SIZE_MB = 20;
+    const ACCEPTED_TYPES = [
+      "image/jpeg", "image/jpg", "image/pjpeg",
+      "image/png",
+      "image/heic", "image/heif",
+      "image/webp",
+      "image/bmp", "image/x-ms-bmp",
+      "application/pdf"
+    ];
+    const ACCEPTED_EXTENSIONS = /\.(jpe?g|png|heic|heif|webp|bmp|pdf)$/i;
+
+    let selectedFile = null;
+    let downloadBlob = null;
+    let downloadName = "separations.zip";
+    let previewObjectUrl = null;
+
+    function setFile(file) {
+      if (!file) return;
+      if (!ACCEPTED_TYPES.includes(file.type) && !ACCEPTED_EXTENSIONS.test(file.name)) {
+        showError("Please upload a JPEG, PNG, HEIC, WebP, BMP, or PDF");
+        return;
+      }
+      if (file.size > MAX_SIZE_MB * 1024 * 1024) {
+        showError(`File must be under ${MAX_SIZE_MB}MB`);
+        return;
+      }
+      clearBanners();
+      selectedFile = file;
+      if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
+      const browserRenderable = /^image\/(jpeg|jpg|png|webp|bmp|gif)$/i.test(file.type) ||
+                                /\.(jpe?g|png|webp|bmp|gif)$/i.test(file.name);
+      if (browserRenderable) {
+        previewObjectUrl = URL.createObjectURL(file);
+        previewImg.src = previewObjectUrl;
+        previewImg.style.display = "";
+      } else {
+        previewImg.removeAttribute("src");
+        previewImg.style.display = "none";
+        previewObjectUrl = null;
+      }
+      previewName.textContent = file.name;
+      previewSize.textContent = formatBytes(file.size);
+      filePreview.style.display = "flex";
+      processBtn.disabled = false;
+    }
+
+    function clearFile() {
+      selectedFile = null;
+      fileInput.value = "";
+      if (previewObjectUrl) { URL.revokeObjectURL(previewObjectUrl); previewObjectUrl = null; }
+      filePreview.style.display = "none";
+      processBtn.disabled = true;
+    }
+
+    function formatBytes(bytes) {
+      if (bytes < 1024) return bytes + " B";
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+      return (bytes / 1024 / 1024).toFixed(2) + " MB";
+    }
+
+    function clearBanners() {
+      errorBanner.classList.remove("active");
+      warningBanner.classList.remove("active");
+    }
+    function showError(message, photopeaUrl) {
+      errorBanner.innerHTML = message +
+        (photopeaUrl ? ` <a href="${photopeaUrl}" target="_blank" rel="noopener">Open in Photopea →</a>` : "");
+      errorBanner.classList.add("active");
+    }
+    function showWarning(message) {
+      warningBanner.textContent = message;
+      warningBanner.classList.add("active");
+    }
+
+    function setStep(stage) {
+      // stages: 'upload', 'vectorize', 'separate', 'ready', 'idle'
+      const order = ["upload", "vectorize", "separate", "ready"];
+      order.forEach((name) => {
+        const step = $("step-" + name);
+        const label = $("label-" + name);
+        step.classList.remove("active", "done");
+        label.classList.remove("active");
+      });
+      if (stage === "idle") return;
+      const idx = order.indexOf(stage);
+      order.forEach((name, i) => {
+        const step = $("step-" + name);
+        const label = $("label-" + name);
+        if (i < idx) step.classList.add("done");
+        if (i === idx) { step.classList.add("active"); label.classList.add("active"); }
+      });
+    }
+
+    async function process() {
+      if (!selectedFile) return;
+      clearBanners();
+      processBtn.disabled = true;
+      resultPanel.classList.remove("active");
+      progressPanel.classList.add("active");
+      setStep("upload");
+
+      const form = new FormData();
+      form.append("file", selectedFile);
+      if (jobName.value.trim()) form.append("job_name", jobName.value.trim());
+
+      // Optimistic UI: advance through stages on a timer while the single
+      // fetch is in flight. Stages approximate real pipeline durations.
+      let stageTimer = setTimeout(() => setStep("vectorize"), 300);
+      let stageTimer2 = setTimeout(() => setStep("separate"), 8000);
+
+      try {
+        const response = await fetch("/process", { method: "POST", body: form });
+        clearTimeout(stageTimer); clearTimeout(stageTimer2);
+
+        if (!response.ok) {
+          let errorJson = null;
+          try { errorJson = await response.json(); } catch (e) {}
+          const msg = (errorJson && (errorJson.detail || errorJson.error)) ||
+                      `Request failed (${response.status})`;
+          const photopea = errorJson && errorJson.photopea_url;
+          showError(msg, photopea);
+          progressPanel.classList.remove("active");
+          setStep("idle");
+          processBtn.disabled = false;
+          return;
+        }
+
+        setStep("ready");
+
+        const headers = response.headers;
+        const warnOneColor = headers.get("X-Warning-Only-One-Color") === "1";
+        const warnComplex = headers.get("X-Warning-Complex-Design") === "1";
+        const colorCount = parseInt(headers.get("X-Color-Count") || "0", 10);
+        const colorNames = (headers.get("X-Color-Names") || "").split(",").filter(Boolean);
+        const colorHexes = (headers.get("X-Color-Hexes") || "").split(",").filter(Boolean);
+
+        downloadBlob = await response.blob();
+        const contentDisp = headers.get("Content-Disposition") || "";
+        const match = contentDisp.match(/filename="?([^";]+)"?/i);
+        if (match) downloadName = match[1];
+
+        renderResults(colorCount, colorNames, colorHexes);
+
+        if (warnOneColor) showWarning("Only 1 color found — verify this is correct before printing.");
+        if (warnComplex) showWarning("Complex design — more than 10 colors detected. Review before printing.");
+
+        resultPanel.classList.add("active");
+      } catch (err) {
+        clearTimeout(stageTimer); clearTimeout(stageTimer2);
+        console.error(err);
+        showError("Network error — check your connection and try again.");
+        progressPanel.classList.remove("active");
+        setStep("idle");
+      } finally {
+        processBtn.disabled = false;
+      }
+    }
+
+    function renderResults(count, names, hexes) {
+      colorBadge.textContent = `${count} color${count === 1 ? "" : "s"} detected`;
+      colorGrid.innerHTML = "";
+      for (let i = 0; i < count; i++) {
+        const name = names[i] || `Color ${i + 1}`;
+        const hex = hexes[i] || "#888888";
+        const chip = document.createElement("div");
+        chip.className = "color-chip";
+        chip.innerHTML = `
+          <div class="swatch" style="background:${hex}"></div>
+          <div class="name">${escapeHtml(name)}</div>
+          <div class="hex">${escapeHtml(hex)}</div>
+        `;
+        colorGrid.appendChild(chip);
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      })[c]);
+    }
+
+    function triggerDownload() {
+      if (!downloadBlob) return;
+      const url = URL.createObjectURL(downloadBlob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = downloadName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    }
+
+    // --- Event wiring ---------------------------------------------------
+    dropzone.addEventListener("click", () => fileInput.click());
+    dropzone.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); }
+    });
+    dropzone.addEventListener("dragover", (e) => { e.preventDefault(); dropzone.classList.add("drag-active"); });
+    dropzone.addEventListener("dragleave", () => dropzone.classList.remove("drag-active"));
+    dropzone.addEventListener("drop", (e) => {
+      e.preventDefault();
+      dropzone.classList.remove("drag-active");
+      if (e.dataTransfer.files && e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener("change", (e) => {
+      if (e.target.files && e.target.files[0]) setFile(e.target.files[0]);
+    });
+    clearBtn.addEventListener("click", (e) => { e.stopPropagation(); clearFile(); });
+    processBtn.addEventListener("click", process);
+    downloadBtn.addEventListener("click", triggerDownload);
+  </script>
+</body>
+</html>
