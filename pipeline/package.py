@@ -38,10 +38,21 @@ def _render_summary(layers: list[ColorLayer], job_name: str | None) -> str:
     lines.append(f"Colors: {len(layers)}")
     lines.append("")
     lines.append("Name            Hex        Coverage")
-    lines.append("-" * 40)
+    lines.append("-" * 50)
     for layer in layers:
+        coverage_field = (
+            "  ERROR" if layer.coverage_error else f"{layer.coverage_pct:>6.2f}%"
+        )
+        flags = []
+        if layer.is_white_ink:
+            flags.append("white-ink")
+        if layer.is_stroke_only:
+            flags.append("stroke-only")
+        if layer.coverage_error:
+            flags.append("coverage_error: true")
+        flag_field = (" [" + ", ".join(flags) + "]") if flags else ""
         lines.append(
-            f"{layer.name:<15} {layer.hex:<10} {layer.coverage_pct:>6.2f}%"
+            f"{layer.name:<15} {layer.hex:<10} {coverage_field}{flag_field}"
         )
     return "\n".join(lines) + "\n"
 

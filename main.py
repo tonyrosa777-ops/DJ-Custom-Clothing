@@ -231,6 +231,10 @@ async def process(
             headers["X-Warning-Only-One-Color"] = "1"
         if separation.complex_design:
             headers["X-Warning-Complex-Design"] = "1"
+        if separation.gradients_detected:
+            headers["X-Warning-Gradients"] = "1"
+        if separation.stroke_only_fallback:
+            headers["X-Warning-StrokeOnly"] = "1"
 
         return FileResponse(
             path=str(zip_path),

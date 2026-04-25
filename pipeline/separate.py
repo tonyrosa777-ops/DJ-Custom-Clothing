@@ -29,6 +29,8 @@ _DEDUPE_THRESHOLD = 10.0
 _COVERAGE_DPI = 72
 _BACKGROUND_COVERAGE_RATIO = 0.98  # bbox area / viewBox area required to call something "background"
 _STYLE_FILL_RE = re.compile(r"fill\s*:\s*(#[0-9a-fA-F]{3,6}|none|[a-zA-Z]+)")
+_STYLE_STROKE_RE = re.compile(r"stroke\s*:\s*(#[0-9a-fA-F]{3,6}|none|[a-zA-Z]+)")
+_GRADIENT_REF_RE = re.compile(r"url\(\s*#[^)]+\)", re.IGNORECASE)
 _SVG_NS = "http://www.w3.org/2000/svg"
 
 
@@ -39,6 +41,8 @@ class ColorLayer:
     path_count: int
     coverage_pct: float = 0.0
     is_white_ink: bool = False
+    coverage_error: bool = False
+    is_stroke_only: bool = False  # color came from stroke fallback, not a fill
 
 
 @dataclass
@@ -46,6 +50,8 @@ class SeparationResult:
     layers: list[ColorLayer] = field(default_factory=list)
     only_one_color: bool = False
     complex_design: bool = False
+    gradients_detected: bool = False
+    stroke_only_fallback: bool = False  # all colors came from strokes (no fills)
 
 
 class NoColorsDetected(Exception):
@@ -70,15 +76,44 @@ def _extract_fill(element) -> str | None:
     return None
 
 
-def _iter_colored_elements(root):
-    """Yield every element that has a resolvable fill color."""
+def _extract_stroke(element) -> str | None:
+    """Return a normalized #RRGGBB from an element's stroke attribute or inline style."""
+    stroke_attr = element.get("stroke")
+    normalized = normalize_hex(stroke_attr) if stroke_attr else None
+    if normalized:
+        return normalized
+
+    style = element.get("style")
+    if style:
+        match = _STYLE_STROKE_RE.search(style)
+        if match:
+            return normalize_hex(match.group(1))
+
+    return None
+
+
+def _has_gradient_paint(element) -> bool:
+    """True if the element references a gradient via fill/stroke url(#...)."""
+    for attr in ("fill", "stroke"):
+        value = element.get(attr) or ""
+        if _GRADIENT_REF_RE.search(value):
+            return True
+    style = element.get("style") or ""
+    if _GRADIENT_REF_RE.search(style):
+        return True
+    return False
+
+
+_SKIPPED_TAGS = frozenset({"defs", "clipPath", "mask", "style", "metadata", "title", "desc"})
+
+
+def _iter_paintable_elements(root):
+    """Yield every element that could contribute a fill or stroke color."""
     for element in root.iter():
         tag = etree.QName(element).localname if isinstance(element.tag, str) else None
-        if tag in (None, "defs", "clipPath", "mask", "style", "metadata", "title", "desc"):
+        if tag is None or tag in _SKIPPED_TAGS:
             continue
-        fill = _extract_fill(element)
-        if fill is not None:
-            yield element, fill
+        yield element, tag
 
 
 def _bbox_for_element(element) -> tuple[float, float, float, float] | None:
@@ -190,29 +225,82 @@ def _dedupe_colors(hex_list: list[str]) -> dict[str, str]:
     return mapping
 
 
-def _compute_coverage(svg_bytes: bytes, color_hexes: list[str]) -> dict[str, float]:
+# Sentinel used by _compute_coverage to flag a render that crashed.
+COVERAGE_ERROR_SENTINEL: float = -1.0
+
+
+def _compute_coverage(parsed_root, color_hexes: list[str]) -> dict[str, float]:
     """For each color, render a low-DPI separation raster and count black pixels.
 
-    Returns {hex: coverage_fraction} where fraction is non-white-pixels / total.
+    Takes a pre-parsed SVG root (not bytes) so we don't re-parse N+1 times.
+    Returns {hex: fraction_in_[0,1]} or COVERAGE_ERROR_SENTINEL on render failure.
     Import is lazy because export imports numpy/svglib which are heavy at startup.
     """
-    # Lazy import to avoid circular deps and keep import surface small.
-    from pipeline.export import mutate_svg_for_color, rasterize_svg_to_pil
+    from pipeline.export import mutate_parsed_svg_for_color, rasterize_svg_to_pil
 
     coverage: dict[str, float] = {}
     for hex_value in color_hexes:
         try:
-            mutated = mutate_svg_for_color(svg_bytes, hex_value, bleed_inches=0.0)
+            mutated = mutate_parsed_svg_for_color(parsed_root, hex_value, bleed_inches=0.0)
             image = rasterize_svg_to_pil(mutated, dpi=_COVERAGE_DPI)
             gray = image.convert("L")
             arr = np.asarray(gray)
             total = arr.size or 1
             black_count = int(np.count_nonzero(arr < 128))
             coverage[hex_value] = black_count / total
-        except Exception as exc:  # pragma: no cover — coverage is best-effort
+        except Exception as exc:
             log.warning("Coverage render failed for %s: %s", hex_value, exc)
-            coverage[hex_value] = 0.0
+            coverage[hex_value] = COVERAGE_ERROR_SENTINEL
     return coverage
+
+
+def _walk_colors(root) -> tuple[dict[str, int], dict[str, int], bool]:
+    """Walk the SVG and collect:
+        - fill_counts: {hex: occurrence count}
+        - stroke_counts: {hex: occurrence count}
+        - gradients_detected: True if any element uses a url(#...) paint
+    """
+    fill_counts: dict[str, int] = {}
+    stroke_counts: dict[str, int] = {}
+    gradients_detected = False
+
+    for element, _tag in _iter_paintable_elements(root):
+        if _has_gradient_paint(element):
+            gradients_detected = True
+
+        fill = _extract_fill(element)
+        if fill is not None:
+            fill_counts[fill] = fill_counts.get(fill, 0) + 1
+
+        stroke = _extract_stroke(element)
+        if stroke is not None:
+            stroke_counts[stroke] = stroke_counts.get(stroke, 0) + 1
+
+    return fill_counts, stroke_counts, gradients_detected
+
+
+def _filter_color_pool(
+    counts: dict[str, int],
+    background_hex: str | None,
+    dark_background: bool,
+) -> dict[str, int]:
+    """Apply background + near-white filtering to a color → count map."""
+    if not counts:
+        return {}
+    dedup_map = _dedupe_colors(list(counts.keys()))
+    canonical: dict[str, int] = {}
+    for original_hex, count in counts.items():
+        key = dedup_map[original_hex]
+        canonical[key] = canonical.get(key, 0) + count
+
+    filtered: dict[str, int] = {}
+    for hex_value, count in canonical.items():
+        if background_hex and colors_match(hex_value, background_hex, threshold=_DEDUPE_THRESHOLD):
+            continue
+        if is_near_white(hex_value) and not dark_background:
+            continue
+        filtered[hex_value] = count
+    return filtered
 
 
 def extract_colors(svg_bytes: bytes) -> SeparationResult:
@@ -222,55 +310,57 @@ def extract_colors(svg_bytes: bytes) -> SeparationResult:
     except etree.XMLSyntaxError as exc:
         raise NoColorsDetected(f"Invalid SVG payload: {exc}") from exc
 
-    fill_counts: dict[str, int] = {}
-    raw_fills: list[str] = []
-    for _, fill_hex in _iter_colored_elements(root):
-        fill_counts[fill_hex] = fill_counts.get(fill_hex, 0) + 1
-        raw_fills.append(fill_hex)
+    fill_counts, stroke_counts, gradients_detected = _walk_colors(root)
 
-    if not fill_counts:
-        raise NoColorsDetected("No fill colors found in vectorized SVG.")
+    if not fill_counts and not stroke_counts:
+        raise NoColorsDetected("No fill or stroke colors found in vectorized SVG.")
 
     background_hex = _detect_background(root)
     dark_background = background_hex is not None and not is_near_white(background_hex)
 
-    # Dedupe via delta-E clustering.
-    dedup_map = _dedupe_colors(list(fill_counts.keys()))
-    canonical_counts: dict[str, int] = {}
-    for original_hex, count in fill_counts.items():
-        canonical = dedup_map[original_hex]
-        canonical_counts[canonical] = canonical_counts.get(canonical, 0) + count
+    # Try fills first.
+    filtered_fills = _filter_color_pool(fill_counts, background_hex, dark_background)
+    stroke_only_fallback = False
+    color_pool: dict[str, int]
 
-    # If the background color made it into our list (it typically will), drop it.
-    filtered: dict[str, int] = {}
-    for hex_value, count in canonical_counts.items():
-        if background_hex and colors_match(hex_value, background_hex, threshold=_DEDUPE_THRESHOLD):
-            continue
-        if is_near_white(hex_value) and not dark_background:
-            # Pure/near-white on a white (or unknown) canvas = background, skip.
-            continue
-        filtered[hex_value] = count
+    if filtered_fills:
+        color_pool = filtered_fills
+    else:
+        # Fall back to strokes if fills produced nothing usable.
+        filtered_strokes = _filter_color_pool(stroke_counts, background_hex, dark_background)
+        if not filtered_strokes:
+            raise NoColorsDetected("No printable colors detected — try a higher resolution image.")
+        color_pool = filtered_strokes
+        stroke_only_fallback = True
+        log.info("Falling back to stroke colors (no fills detected after filtering).")
 
-    if not filtered:
-        raise NoColorsDetected("No printable colors detected — try a higher resolution image.")
-
-    # Compute coverage for sort order.
-    coverage_by_hex = _compute_coverage(svg_bytes, list(filtered.keys()))
+    # Coverage computation reuses the parsed root — no re-parsing N+1 times.
+    coverage_by_hex = _compute_coverage(root, list(color_pool.keys()))
 
     layers: list[ColorLayer] = []
-    for hex_value, path_count in filtered.items():
+    for hex_value, path_count in color_pool.items():
         is_white_ink = dark_background and is_near_white(hex_value)
+        raw_coverage = coverage_by_hex.get(hex_value, COVERAGE_ERROR_SENTINEL)
+        if raw_coverage == COVERAGE_ERROR_SENTINEL:
+            coverage_pct = 0.0
+            coverage_error = True
+        else:
+            coverage_pct = round(raw_coverage * 100, 2)
+            coverage_error = False
         layers.append(
             ColorLayer(
                 hex=hex_value,
                 name="White_INK" if is_white_ink else name_color(hex_value),
                 path_count=path_count,
-                coverage_pct=round(coverage_by_hex.get(hex_value, 0.0) * 100, 2),
+                coverage_pct=coverage_pct,
                 is_white_ink=is_white_ink,
+                coverage_error=coverage_error,
+                is_stroke_only=stroke_only_fallback,
             )
         )
 
-    # Sort by coverage desc; path_count is the stable tiebreaker.
+    # Sort by coverage desc; path_count is stable tiebreaker. Errored coverages
+    # sink to the bottom (0.0).
     layers.sort(key=lambda layer: (layer.coverage_pct, layer.path_count), reverse=True)
 
     # De-duplicate color NAMES so multiple "Red" layers become Red, Red_2, Red_3, etc.
@@ -285,4 +375,6 @@ def extract_colors(svg_bytes: bytes) -> SeparationResult:
         layers=layers,
         only_one_color=len(layers) == 1,
         complex_design=len(layers) > 10,
+        gradients_detected=gradients_detected,
+        stroke_only_fallback=stroke_only_fallback,
     )

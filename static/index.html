@@ -146,38 +146,28 @@
 
     .progress-panel { display: none; }
     .progress-panel.active { display: block; }
-    .stepper {
+    .progress-row {
       display: flex;
-      gap: 8px;
-      margin-bottom: 8px;
+      align-items: center;
+      gap: 14px;
     }
-    .step {
+    .spinner {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      border: 3px solid rgba(255, 122, 26, 0.25);
+      border-top-color: var(--accent);
+      animation: spin 0.9s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .progress-text {
+      font-size: 14px;
+      color: var(--text);
       flex: 1;
-      height: 6px;
-      background: #252935;
-      border-radius: 3px;
-      overflow: hidden;
-      position: relative;
     }
-    .step.active::after {
-      content: '';
-      position: absolute; inset: 0;
-      background: var(--accent);
-      animation: pulse 1.4s ease-in-out infinite;
-    }
-    .step.done { background: var(--accent); }
-    .step-labels {
-      display: flex;
-      gap: 8px;
-      font-size: 12px;
-      color: var(--text-dim);
-    }
-    .step-labels span { flex: 1; text-align: center; }
-    .step-labels span.active { color: var(--text); font-weight: 500; }
-    @keyframes pulse {
-      0%, 100% { opacity: 0.4; }
-      50% { opacity: 1; }
-    }
+    .progress-text .label { font-weight: 500; }
+    .progress-text .elapsed { color: var(--text-dim); font-size: 12px; margin-top: 2px; }
 
     .result-panel { display: none; }
     .result-panel.active { display: block; }
@@ -279,17 +269,12 @@
     </section>
 
     <section id="progressPanel" class="panel progress-panel">
-      <div class="stepper">
-        <div class="step" id="step-upload"></div>
-        <div class="step" id="step-vectorize"></div>
-        <div class="step" id="step-separate"></div>
-        <div class="step" id="step-ready"></div>
-      </div>
-      <div class="step-labels">
-        <span id="label-upload">Uploading</span>
-        <span id="label-vectorize">Vectorizing</span>
-        <span id="label-separate">Separating Colors</span>
-        <span id="label-ready">Ready</span>
+      <div class="progress-row">
+        <div class="spinner" aria-hidden="true"></div>
+        <div class="progress-text">
+          <div class="label" id="progressLabel">Processing…</div>
+          <div class="elapsed" id="progressElapsed">0s elapsed</div>
+        </div>
       </div>
     </section>
 
@@ -398,23 +383,47 @@
       warningBanner.classList.add("active");
     }
 
-    function setStep(stage) {
-      // stages: 'upload', 'vectorize', 'separate', 'ready', 'idle'
-      const order = ["upload", "vectorize", "separate", "ready"];
-      order.forEach((name) => {
-        const step = $("step-" + name);
-        const label = $("label-" + name);
-        step.classList.remove("active", "done");
-        label.classList.remove("active");
-      });
-      if (stage === "idle") return;
-      const idx = order.indexOf(stage);
-      order.forEach((name, i) => {
-        const step = $("step-" + name);
-        const label = $("label-" + name);
-        if (i < idx) step.classList.add("done");
-        if (i === idx) { step.classList.add("active"); label.classList.add("active"); }
-      });
+    let progressStartTime = 0;
+    let progressTimer = null;
+
+    function startProgress(label) {
+      $("progressLabel").textContent = label || "Processing…";
+      progressStartTime = Date.now();
+      $("progressElapsed").textContent = "0s elapsed";
+      progressPanel.classList.add("active");
+      if (progressTimer) clearInterval(progressTimer);
+      progressTimer = setInterval(() => {
+        const seconds = Math.floor((Date.now() - progressStartTime) / 1000);
+        $("progressElapsed").textContent = `${seconds}s elapsed`;
+      }, 250);
+    }
+
+    function stopProgress() {
+      if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+      progressPanel.classList.remove("active");
+    }
+
+    function showWarnings(headers) {
+      const messages = [];
+      if (headers.get("X-Warning-Only-One-Color") === "1") {
+        messages.push("Only 1 color found — verify this is correct before printing.");
+      }
+      if (headers.get("X-Warning-Complex-Design") === "1") {
+        messages.push("Complex design — more than 10 colors detected. Review before printing.");
+      }
+      if (headers.get("X-Warning-Gradients") === "1") {
+        messages.push("This logo contains gradients which were skipped — review output carefully.");
+      }
+      if (headers.get("X-Warning-MultiPage") === "1") {
+        messages.push("Multi-page PDF detected — only the first page was processed.");
+      }
+      if (headers.get("X-Warning-StrokeOnly") === "1") {
+        messages.push("Logo only had outlines (no fills) — stroke colors were used as the separation list.");
+      }
+      if (messages.length) {
+        warningBanner.innerHTML = messages.map(escapeHtml).join("<br>");
+        warningBanner.classList.add("active");
+      }
     }
 
     async function process() {
@@ -422,21 +431,14 @@
       clearBanners();
       processBtn.disabled = true;
       resultPanel.classList.remove("active");
-      progressPanel.classList.add("active");
-      setStep("upload");
+      startProgress("Processing your logo…");
 
       const form = new FormData();
       form.append("file", selectedFile);
       if (jobName.value.trim()) form.append("job_name", jobName.value.trim());
 
-      // Optimistic UI: advance through stages on a timer while the single
-      // fetch is in flight. Stages approximate real pipeline durations.
-      let stageTimer = setTimeout(() => setStep("vectorize"), 300);
-      let stageTimer2 = setTimeout(() => setStep("separate"), 8000);
-
       try {
         const response = await fetch("/process", { method: "POST", body: form });
-        clearTimeout(stageTimer); clearTimeout(stageTimer2);
 
         if (!response.ok) {
           let errorJson = null;
@@ -445,17 +447,12 @@
                       `Request failed (${response.status})`;
           const photopea = errorJson && errorJson.photopea_url;
           showError(msg, photopea);
-          progressPanel.classList.remove("active");
-          setStep("idle");
+          stopProgress();
           processBtn.disabled = false;
           return;
         }
 
-        setStep("ready");
-
         const headers = response.headers;
-        const warnOneColor = headers.get("X-Warning-Only-One-Color") === "1";
-        const warnComplex = headers.get("X-Warning-Complex-Design") === "1";
         const colorCount = parseInt(headers.get("X-Color-Count") || "0", 10);
         const colorNames = (headers.get("X-Color-Names") || "").split(",").filter(Boolean);
         const colorHexes = (headers.get("X-Color-Hexes") || "").split(",").filter(Boolean);
@@ -466,17 +463,14 @@
         if (match) downloadName = match[1];
 
         renderResults(colorCount, colorNames, colorHexes);
+        showWarnings(headers);
 
-        if (warnOneColor) showWarning("Only 1 color found — verify this is correct before printing.");
-        if (warnComplex) showWarning("Complex design — more than 10 colors detected. Review before printing.");
-
+        stopProgress();
         resultPanel.classList.add("active");
       } catch (err) {
-        clearTimeout(stageTimer); clearTimeout(stageTimer2);
         console.error(err);
         showError("Network error — check your connection and try again.");
-        progressPanel.classList.remove("active");
-        setStep("idle");
+        stopProgress();
       } finally {
         processBtn.disabled = false;
       }

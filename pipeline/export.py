@@ -7,6 +7,7 @@ with a 0.125" bleed on all sides.
 """
 from __future__ import annotations
 
+import copy
 import io
 import re
 from pathlib import Path
@@ -22,7 +23,8 @@ from pipeline.color_math import colors_match, normalize_hex
 
 _SVG_NS = "http://www.w3.org/2000/svg"
 _STYLE_FILL_RE = re.compile(r"fill\s*:\s*(#[0-9a-fA-F]{3,6}|none|[a-zA-Z]+)")
-_STYLE_STROKE_RE = re.compile(r"stroke\s*:\s*([^;]+)")
+_STYLE_STROKE_RE = re.compile(r"stroke\s*:\s*(#[0-9a-fA-F]{3,6}|none|[a-zA-Z]+)")
+_STYLE_STROKE_ANY_RE = re.compile(r"stroke\s*:\s*([^;]+)")
 
 _POINTS_PER_INCH = 72.0
 _SVG_DEFAULT_USER_UNITS_PER_INCH = 96.0  # SVG spec default if no explicit units.
@@ -80,61 +82,74 @@ def _parse_viewbox(root) -> tuple[float, float, float, float]:
     return 0.0, 0.0, _strip_unit(width), _strip_unit(height)
 
 
-def _rewrite_fill(element, target_hex: str) -> None:
-    """Set this element's fill to black if it matches target_hex, else white."""
-    current_fill = element.get("fill")
-    style = element.get("style")
-
-    effective: str | None = None
-    if current_fill:
-        normalized = normalize_hex(current_fill)
+def _resolve_paint(element, attr: str, style_re: re.Pattern[str]) -> str | None:
+    """Resolve effective paint color (#RRGGBB) from attribute or inline style."""
+    raw = element.get(attr)
+    if raw:
+        if raw.strip().lower() == "none":
+            return None
+        normalized = normalize_hex(raw)
         if normalized:
-            effective = normalized
-        elif current_fill.strip().lower() == "none":
-            # Keep "none" filled shapes invisible by treating as non-matching.
-            effective = None
+            return normalized
 
-    if effective is None and style:
-        match = _STYLE_FILL_RE.search(style)
+    style = element.get("style")
+    if style:
+        match = style_re.search(style)
         if match:
-            effective = normalize_hex(match.group(1))
+            return normalize_hex(match.group(1))
+    return None
 
-    # Decide black or white.
-    if effective and colors_match(effective, target_hex):
-        new_fill = "#000000"
-    else:
-        new_fill = "#FFFFFF"
 
+def _rewrite_fill(element, target_hex: str) -> None:
+    """Recolor this element so target-hex paint becomes black, everything else white.
+
+    Both fill and stroke are inspected. If the fill matches the target color
+    the fill becomes black; otherwise white. If the stroke matches the target
+    the stroke is preserved at black; otherwise the stroke is dropped to none.
+    This means stroked-only paths still render their lines on the right layer.
+    """
+    fill_color = _resolve_paint(element, "fill", _STYLE_FILL_RE)
+    stroke_color = _resolve_paint(element, "stroke", _STYLE_STROKE_RE)
+
+    fill_matches = bool(fill_color) and colors_match(fill_color, target_hex)
+    stroke_matches = bool(stroke_color) and colors_match(stroke_color, target_hex)
+
+    new_fill = "#000000" if fill_matches else "#FFFFFF"
     element.set("fill", new_fill)
+
+    if stroke_matches:
+        element.set("stroke", "#000000")
+    else:
+        element.set("stroke", "none")
+
     # Strip style fill/stroke so they can't override the attribute.
+    style = element.get("style")
     if style:
         cleaned = _STYLE_FILL_RE.sub("", style)
-        cleaned = _STYLE_STROKE_RE.sub("", cleaned)
+        cleaned = _STYLE_STROKE_ANY_RE.sub("", cleaned)
         cleaned = re.sub(r";\s*;", ";", cleaned).strip(" ;")
         if cleaned:
             element.set("style", cleaned)
         else:
             element.attrib.pop("style", None)
-    element.set("stroke", "none")
-    # Solid fill at full opacity.
+
     element.set("fill-opacity", "1")
     element.set("opacity", "1")
 
 
-def mutate_svg_for_color(
-    svg_bytes: bytes, target_hex: str, bleed_inches: float = 0.125
-) -> bytes:
-    """Return a modified SVG where target-hex paths are black on white, with bleed.
+_PAINTABLE_TAGS = frozenset({
+    "path", "rect", "circle", "ellipse", "polygon", "polyline",
+    "line", "text", "tspan", "g", "use",
+})
+_SKIPPED_PAINT_TAGS = frozenset({
+    "defs", "clipPath", "mask", "style", "metadata", "title", "desc",
+})
 
-    The SVG's viewBox is extended outward by `bleed_inches` on all sides, and
-    a full-canvas white <rect> is inserted as the first child so the bleed
-    region renders as white.
-    """
-    root = etree.fromstring(svg_bytes)
 
+def _mutate_tree_in_place(root, target_hex: str, bleed_inches: float) -> None:
+    """Apply per-color black/white rewrite + bleed expansion to a parsed SVG root."""
     min_x, min_y, vb_w, vb_h = _parse_viewbox(root)
 
-    # Compute user-units-per-inch.
     width_inches = _parse_length_to_inches(root.get("width", ""), vb_w)
     height_inches = _parse_length_to_inches(root.get("height", ""), vb_h)
     uupi_x = vb_w / width_inches if width_inches > 0 else _SVG_DEFAULT_USER_UNITS_PER_INCH
@@ -147,30 +162,21 @@ def mutate_svg_for_color(
     new_w = vb_w + 2 * bleed_x
     new_h = vb_h + 2 * bleed_y
 
-    # Rewrite every filled element.
     for element in root.iter():
         if not isinstance(element.tag, str):
             continue
         local = _strip_ns(element.tag)
-        if local in ("defs", "clipPath", "mask", "style", "metadata", "title", "desc"):
+        if local in _SKIPPED_PAINT_TAGS or local == "svg":
             continue
-        if local == "svg":
-            continue
-        # Only mutate elements that could carry a fill (paths, shapes, text, groups).
-        if local in (
-            "path", "rect", "circle", "ellipse", "polygon", "polyline",
-            "line", "text", "tspan", "g", "use",
-        ):
+        if local in _PAINTABLE_TAGS:
             _rewrite_fill(element, target_hex)
 
-    # Set viewBox and explicit pixel dimensions so svglib knows the scale.
     root.set("viewBox", f"{new_min_x} {new_min_y} {new_w} {new_h}")
     new_width_in = width_inches + 2 * bleed_inches
     new_height_in = height_inches + 2 * bleed_inches
     root.set("width", f"{new_width_in:.4f}in")
     root.set("height", f"{new_height_in:.4f}in")
 
-    # Prepend a full-canvas white rect so the bleed region is white.
     white_rect = etree.SubElement(root, f"{{{_SVG_NS}}}rect")
     white_rect.set("x", str(new_min_x))
     white_rect.set("y", str(new_min_y))
@@ -178,10 +184,35 @@ def mutate_svg_for_color(
     white_rect.set("height", str(new_h))
     white_rect.set("fill", "#FFFFFF")
     white_rect.set("stroke", "none")
-    # Move it to be the very first child so everything else paints on top.
     root.remove(white_rect)
     root.insert(0, white_rect)
 
+
+def mutate_parsed_svg_for_color(
+    parsed_root, target_hex: str, bleed_inches: float = 0.125
+) -> bytes:
+    """Variant of mutate_svg_for_color that takes a pre-parsed root.
+
+    Deepcopies the input so the caller's tree is never modified. Use this when
+    you're going to mutate the same SVG for many different target colors —
+    avoids re-parsing the bytes N+1 times.
+    """
+    root_copy = copy.deepcopy(parsed_root)
+    _mutate_tree_in_place(root_copy, target_hex, bleed_inches)
+    return etree.tostring(root_copy, xml_declaration=True, encoding="utf-8")
+
+
+def mutate_svg_for_color(
+    svg_bytes: bytes, target_hex: str, bleed_inches: float = 0.125
+) -> bytes:
+    """Return a modified SVG where target-hex paths are black on white, with bleed.
+
+    The SVG's viewBox is extended outward by `bleed_inches` on all sides, and
+    a full-canvas white <rect> is inserted as the first child so the bleed
+    region renders as white.
+    """
+    root = etree.fromstring(svg_bytes)
+    _mutate_tree_in_place(root, target_hex, bleed_inches)
     return etree.tostring(root, xml_declaration=True, encoding="utf-8")
 
 

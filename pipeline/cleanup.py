@@ -40,6 +40,9 @@ _SATURATION_COVERAGE_THRESHOLD = 0.05  # Fraction of pixels with saturation > 40
 _DENOISE_H = 7
 _DENOISE_TEMPLATE_WINDOW = 7
 _DENOISE_SEARCH_WINDOW = 21
+# Cap input dim before denoising — fastNlMeansDenoising is O(n · template² · search²),
+# 30+ seconds on a 6000px input on Render's CPU. 1500px keeps it under 5 seconds.
+_DENOISE_MAX_DIMENSION = 1500
 
 
 def _is_effectively_monochrome(image: Image.Image) -> bool:
@@ -79,7 +82,36 @@ def _is_effectively_monochrome(image: Image.Image) -> bool:
 
 
 def _denoise(image: Image.Image) -> Image.Image:
-    """Apply fastNlMeansDenoising — single-channel for L mode, colored for RGB."""
+    """Apply fastNlMeansDenoising — single-channel for L mode, colored for RGB.
+
+    Skips denoising entirely when the image is smaller than the template window
+    (e.g. 1×1 favicons), since OpenCV would error. For oversized inputs the
+    image is downscaled first to keep runtime bounded, then upscaled back.
+    """
+    w, h = image.size
+    min_required = _DENOISE_TEMPLATE_WINDOW
+    if w < min_required or h < min_required:
+        log.info("Skipping denoise — image %sx%s smaller than template window %s.",
+                 w, h, min_required)
+        return image
+
+    # Downscale before denoising if the image is huge.
+    longest = max(w, h)
+    needs_downscale = longest > _DENOISE_MAX_DIMENSION
+    if needs_downscale:
+        scale = _DENOISE_MAX_DIMENSION / longest
+        small_size = (max(int(w * scale), 1), max(int(h * scale), 1))
+        log.info("Denoise downscale: %sx%s -> %sx%s before denoising.",
+                 w, h, small_size[0], small_size[1])
+        small = image.resize(small_size, Image.LANCZOS)
+        denoised_small = _denoise_core(small)
+        return denoised_small.resize((w, h), Image.LANCZOS)
+
+    return _denoise_core(image)
+
+
+def _denoise_core(image: Image.Image) -> Image.Image:
+    """Run OpenCV fastNlMeansDenoising on the image at its current size."""
     arr = np.asarray(image)
     if image.mode == "L":
         denoised = cv2.fastNlMeansDenoising(
