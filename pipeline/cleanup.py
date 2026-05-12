@@ -31,7 +31,17 @@ _SHARPEN_PASSES = 2
 # sending to the vectorizer. 30/255 ≈ 12% saturation — a safe threshold that
 # catches "black on white with JPEG artifacts" without touching real color.
 _SATURATION_MEAN_THRESHOLD = 30.0
-_SATURATION_COVERAGE_THRESHOLD = 0.05  # Fraction of pixels with saturation > 40.
+# Fraction of pixels with saturation > 40 (moderately saturated). Was 0.05;
+# lowered to 0.02 because logos where the color region is geometrically small
+# relative to whitespace + black text (e.g., a brand logo with a small orange
+# accent on a white field) sit between 2% and 5% and were being miscategorized.
+_SATURATION_COVERAGE_THRESHOLD = 0.02
+# Third signal — fraction of pixels with saturation > 180 (strongly saturated).
+# This catches "tiny but unambiguous color region" cases that the mean and
+# moderate-coverage checks can miss. Even a 0.3% pocket of strong color is
+# strong evidence of intentional color the user wants printed. JPEG chroma
+# noise on truly monochrome scans rarely produces sat > 180.
+_SATURATION_STRONG_FRACTION_THRESHOLD = 0.003
 
 # fastNlMeansDenoising parameters. h controls strength — lower preserves detail,
 # higher smooths harder. 7 is a conservative default for scanned/photographed logos.
@@ -67,15 +77,23 @@ def _is_effectively_monochrome(image: Image.Image) -> bool:
 
     mean_sat = float(saturation[mask].mean())
     high_sat_fraction = float((saturation[mask] > 40).sum()) / float(mask.sum())
+    strong_sat_fraction = float((saturation[mask] > 180).sum()) / float(mask.sum())
 
     log.info(
-        "Cleanup saturation: mean=%.2f high_sat_fraction=%.3f thresholds=(%.1f, %.3f)",
-        mean_sat, high_sat_fraction,
-        _SATURATION_MEAN_THRESHOLD, _SATURATION_COVERAGE_THRESHOLD,
+        "Cleanup saturation: mean=%.2f high_sat=%.3f strong_sat=%.3f thresholds=(%.1f, %.3f, %.3f)",
+        mean_sat, high_sat_fraction, strong_sat_fraction,
+        _SATURATION_MEAN_THRESHOLD,
+        _SATURATION_COVERAGE_THRESHOLD,
+        _SATURATION_STRONG_FRACTION_THRESHOLD,
     )
+    # Classify as monochrome ONLY when all three saturation signals agree.
+    # Any single strong color region (3rd condition) is enough to force
+    # color-mode processing — protects logos like the Optimus mark where
+    # the orange is small but unambiguous.
     return (
         mean_sat < _SATURATION_MEAN_THRESHOLD
         and high_sat_fraction < _SATURATION_COVERAGE_THRESHOLD
+        and strong_sat_fraction < _SATURATION_STRONG_FRACTION_THRESHOLD
     )
 
 

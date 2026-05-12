@@ -1,5 +1,5 @@
 # progress.md — DJ's Art Engine
-**Last updated:** April 2026  
+**Last updated:** May 12, 2026  
 **Status:** 🟡 IN PROGRESS  
 
 ---
@@ -315,6 +315,215 @@ At 100 jobs/month, marginal cost over the previous pipeline: ~$1/month.
 
 ---
 
+## Demo Recovery + Production-Grade Color Separation (May 12, 2026)
+
+Live demo at DJ's shop on 2026-05-12 surfaced **two distinct crises** that
+fed into each other. Both shipped to production today across three commits.
+
+### Crisis 1 — Render OOM during demo (Commit `e09d784`)
+
+5 PM live demo failed with a 502. Render OOM email confirmed: the
+**Bulletproof pipeline** commit (`df16183`) had introduced `asyncio.gather`
+running Replicate upscale + Claude vision QC **in parallel** on a 512 MB
+Render free tier. Combined with the ~150-200 MB import baseline
+(pillow + opencv + lxml + reportlab + httpx + slowapi + pillow-heif),
+peak memory exceeded the ceiling on a real customer JPEG. Worked locally
+(32 GB RAM); died in prod.
+
+Fixes shipped:
+- **Serialize upscale + QC.** Changed `asyncio.gather([upscale, qc])` →
+  sequential await. QC first (cheap, decides whether to spend Replicate
+  + Vectorizer credit on a screenshot-shaped upload). Upscale second,
+  only if QC approves. Latency cost: +10-20 s worst case per job; fine
+  for an internal tool.
+- **Drop intermediate references between stages.** Explicit `del` +
+  `gc.collect()` after the JPEG encode (drops `cleaned_image`) and after
+  vectorize returns (drops `jpeg_bytes`). `intake_result.image = None`
+  after upscale completes when `was_upscaled=True`. Captures
+  `pre_upscale_size` as a local before nulling the dataclass slot, so
+  bbox rescaling + warning headers still work.
+- **PDF render thread pool 4 → 2.** Each thread renders a ~38 MB raster
+  at 300 DPI; four in parallel was the other peak memory hotspot the
+  initial diagnosis missed.
+- **`QC_ENABLED` kill-switch** (mirrors `UPSCALE_ENABLED`). Env-var panic
+  switch to skip the Claude QC stage without unsetting `ANTHROPIC_API_KEY`.
+  Flip from phone via Render env vars dashboard in ~30 seconds if memory
+  goes sideways again on a future build.
+- **Vectorizer.ai 5xx response body capture.** Retry path at
+  `pipeline/vectorize.py` now captures `response.text[:500]` on 5xx (was
+  only logging the status code). Future real Vectorizer failures will be
+  diagnosable from Render logs.
+
+**Render plan upgrade** done in parallel by DJ: Free 512 MB → Standard
+**2 GB**, $25/mo. Confirmed inside the $97/mo retainer math. Note that
+the $7/mo Starter tier is a CPU upgrade only — same 512 MB RAM as Free —
+and was rejected on those grounds.
+
+### Crisis 2 — Color separation quality unusable on real logos (Commits `1ef599a`, _next commit_)
+
+Memory fix shipped, then live testing on Standard tier exposed pre-existing
+color-quality bugs masked by the OOM:
+
+- **Optimus Business Solutions logo** (clean 4-color flat: orange gradient
+  + light gray + dark gray + black) → UI said "4 colors detected" but the
+  ORANGE FILM WAS COMPLETELY ABSENT. All 4 films were grayscale.
+- **Complete Junk Removal logo** (multi-color shaded illustration) → 10+
+  fragmented films, several near-empty, browns split across multiple
+  separations that should be one.
+
+Diagnosis spanned three different files. Three root causes:
+
+#### Bug A — Gradient fills silently dropped (Commit `1ef599a`)
+
+`pipeline/separate.py::_extract_fill()` only normalized direct hex
+values. When Vectorizer.ai represented a region with a gradient (e.g.,
+the orange sun on the Optimus logo: `fill="url(#linearGradient123)"`),
+the function returned `None`. The path's color never entered
+`fill_counts` so no film was produced for that region. Pipeline set
+`gradients_detected=True` warning header but emitted no separation for
+the gradient region — silently dropping it.
+
+**Fix:** new `separate.resolve_gradient_refs(svg_bytes)` public helper.
+Walks `<linearGradient>`/`<radialGradient>` defs, averages each
+gradient's stop colors in RGB, rewrites every `fill="url(#X)"` /
+`stroke="url(#X)"` reference (and inline `style="fill:url(...)"`) to the
+representative hex. Wired into `main.py` immediately after
+`vectorize.vectorize(...)` returns — single point of preprocessing
+ensures debug `vectorized.svg`, separation, and per-color PDF rendering
+all see the resolved SVG.
+
+**Lossy by design** (documented in code): a yellow-to-orange gradient
+collapses to a single mid-orange. Screen-printing presses cannot
+reproduce gradients on a single screen anyway, so a flat representative
+color is what actually prints. The orange-looks-slightly-off appearance
+on the rendered film is expected, not a bug.
+
+V1 scope limitations documented in `_build_gradient_index`:
+`xlink:href` gradient inheritance not followed (rare); `stop-opacity`
+ignored; nested gradient refs not followed.
+
+#### Bug B — Dedupe threshold too tight (Commit `1ef599a`)
+
+`_DEDUPE_THRESHOLD = 10.0` in separate.py and `_MATCH_THRESHOLD = 15.0`
+in color_math.py. At ΔE 10, two browns that look identical on cotton
+still survived as separate films. Anti-aliasing pixels along color
+boundaries became their own near-empty separations. Cotton + ink
+physically cannot reproduce ΔE 10 differences; industry threshold for
+"noticeably different in printed work" is ~ΔE 20-25.
+
+**Fix:** bumped both thresholds to **25**. Match threshold tracks dedupe
+so cluster members co-render on the same film at render time (a wider
+dedupe with a narrower match would let paths fall through the cracks).
+Background filtering broken out as a separate `_BACKGROUND_MATCH_THRESHOLD
+= 10.0` so we don't over-aggressively delete near-bg logo paths just
+because dedupe got wider.
+
+#### Bug C — No hard cap on color count (Commit `1ef599a`)
+
+Even after dedupe, complex shaded illustrations could yield 10-15
+distinct color families. Screen printers run 4-8 color jobs. Pipeline
+had no logic to enforce a cap.
+
+**Fix:** new `_kmeans_consolidate(canonical_counts, k)` in separate.py.
+LAB-space k-means weighted by path count (capped at 100 per row to bound
+sample-expansion memory). Cluster representative selection is a
+deterministic three-key sort: highest count → closest to centroid in
+LAB → lexicographic hex (full determinism across runs). Called after
+`_filter_color_pool` when `len(color_pool) > _MAX_PRINT_COLORS = 8`.
+No-op when dedupe already brought us below the cap.
+
+#### Bug D — Cleanup misclassifying low-saturation-coverage color logos (_next commit, May 12 evening_)
+
+After 1ef599a deployed, the Optimus logo STILL came back with no orange
+and only 2 films (Black + Gray). Render logs surfaced the smoking gun:
+
+```
+[INFO] pipeline.cleanup: Cleanup saturation: mean=5.38 high_sat=0.038 ...
+[INFO] pipeline.cleanup: Cleanup: image classified as monochrome, converting to grayscale.
+```
+
+`pipeline/cleanup.py::_is_effectively_monochrome` was converting the
+whole image to grayscale BEFORE vectorize. Decision logic was:
+```python
+return (mean_sat < 30) and (high_sat_fraction < 0.05)
+```
+For the Optimus logo, the orange occupies only ~3.8% of non-near-black
+pixels (`high_sat_fraction = 0.038`) — just barely below the 5%
+threshold. With both conditions true → grayscale conversion → orange
+stripped → never reaches vectorize → can't produce an orange film no
+matter what the downstream logic does.
+
+The misclassification was geometric: a logo where the *colored region
+is small* relative to the canvas (e.g., a brand logo with a small
+saturated accent on a white field) sat between 2% and 5% coverage and
+got miscategorized as black-on-white.
+
+**Fix:** added a **third saturation signal** + tightened the existing
+moderate-coverage threshold. New decision logic:
+```python
+return (
+    mean_sat < 30
+    and high_sat_fraction < 0.02    # was 0.05
+    and strong_sat_fraction < 0.003  # NEW: catches small unambiguous color regions
+)
+```
+`strong_sat_fraction` counts pixels with saturation > 180 (out of 255)
+— anything that strongly saturated is intentional color, not JPEG
+chroma noise. Even a 0.3% pocket of strongly-saturated pixels is enough
+evidence to force color-mode processing. Synthetic test verified: a 1%
+orange region on white + black text correctly classifies as color;
+pure black-on-white correctly classifies as monochrome.
+
+### Verification on Render (Standard 2 GB)
+
+- e09d784: pipeline runs without OOM on real customer images
+- 1ef599a: Optimus logo color count went 4 (e09d784, all grayscale) → 2
+  (1ef599a, still no orange). Dedupe fix working but the cleanup bug
+  prevented gradient code from ever firing. Junk Removal logo color
+  count went 14 → 4 (proves k-means and dedupe both functional on the
+  case where cleanup correctly kept RGB).
+- Cleanup fix (next commit): expect Optimus logo to produce 4 films
+  with one named Orange/Yellow at ~`#FFA100` capturing the sun crescent
+  region.
+
+### New env vars
+
+```
+QC_ENABLED=true              # kill-switch for Claude QC stage (Bug-1 fix)
+```
+
+### New / changed constants (for future tuning)
+
+| Constant | Old | New | Where |
+|---|---|---|---|
+| `_DEDUPE_THRESHOLD` | 10.0 | 25.0 | `pipeline/separate.py` |
+| `_BACKGROUND_MATCH_THRESHOLD` | (used `_DEDUPE_THRESHOLD`) | 10.0 | `pipeline/separate.py` (new) |
+| `_MAX_PRINT_COLORS` | (no cap) | 8 | `pipeline/separate.py` (new) |
+| `_KMEANS_WEIGHT_CAP` | — | 100 | `pipeline/separate.py` (new) |
+| `_MATCH_THRESHOLD` | 15.0 | 25.0 | `pipeline/color_math.py` |
+| `_SATURATION_COVERAGE_THRESHOLD` | 0.05 | 0.02 | `pipeline/cleanup.py` |
+| `_SATURATION_STRONG_FRACTION_THRESHOLD` | — | 0.003 | `pipeline/cleanup.py` (new) |
+| `_PDF_THREAD_POOL_SIZE` | 4 | 2 | `main.py` |
+
+### Render plan
+
+| Plan | Memory | $/mo | Status |
+|---|---|---|---|
+| Free | 512 MB | $0 | Insufficient for current pipeline (OOMs on real images) |
+| Starter | 512 MB | $7 | **Trap — same RAM as Free, CPU upgrade only** |
+| **Standard** | **2 GB** | **$25** | **Current. Comfortable inside $97/mo retainer** |
+| Pro | 4 GB | $85 | Overkill at current volume (30-40 jobs/mo) |
+
+### Explicitly deferred (still)
+
+- Halftone simulation for gradient regions (current flat-fill collapse is
+  good enough; halftone is a v2 enhancement when DJ asks)
+- Manual color palette override in UI (user picks the 6 colors before
+  the films render) — k-means picks for v1
+- xlink:href gradient inheritance — rare in Vectorizer.ai output
+
+---
+
 ## Notes & Decisions Log
 
 | Date | Decision | Reason |
@@ -322,7 +531,11 @@ At 100 jobs/month, marginal cost over the previous pipeline: ~$1/month.
 | Apr 2026 | PDF output over EPS | DJ prints directly from Windows print dialog — no Illustrator needed |
 | Apr 2026 | Delta-E color matching over RGB euclidean | More perceptually accurate, handles JPEG compression artifacts better |
 | Apr 2026 | No database in v1 | Single user tool, no persistence needed, keeps build fast |
-| Apr 2026 | Render for hosting | Simple Python deploy, $7/mo, reliable enough for internal tool |
+| Apr 2026 | Render for hosting | Simple Python deploy, reliable enough for internal tool |
+| May 2026 | Render Standard ($25/mo, 2 GB) over Starter ($7/mo, 512 MB) | Starter has the same RAM as Free — pure CPU upgrade. Real-ESRGAN + Claude QC need the headroom. Cost still inside the $97/mo retainer. |
+| May 2026 | Resolve SVG gradients to flat representative hex pre-separation | Vectorizer.ai emits `fill="url(#X)"` for shaded regions; without resolution the entire region drops out of the films. Lossy by design — screens can't reproduce gradients anyway. |
+| May 2026 | Add `strong_sat_fraction` (sat > 180) as a third monochrome-classification signal | Mean + moderate-coverage thresholds alone miss logos where the colored region is geometrically small (e.g., a small orange accent on a white field). |
+| May 2026 | k-means cap at 8 colors after Delta-E dedupe | Industry max for screen-printing jobs. Dedupe alone can leave 10-15 colors on shaded illustrations. |
 | Apr 2026 | $1,500 + $97/mo | Family friend rate — market rate for other shops is $297/mo |
 | Apr 2026 | Photopea as fallback | Free, browser-based, no install — replaces Photoshop for manual edge cases |
 
