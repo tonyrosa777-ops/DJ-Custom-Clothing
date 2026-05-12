@@ -21,7 +21,16 @@ from slowapi.util import get_remote_address
 from starlette.background import BackgroundTask
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from pipeline import cleanup, config, intake, package, separate, vectorize
+from pipeline import (
+    cleanup,
+    config,
+    intake,
+    package,
+    quality_check,
+    separate,
+    upscale,
+    vectorize,
+)
 from pipeline.export import render_separation_pdf
 from pipeline.intake import IntakeError
 from pipeline.separate import NoColorsDetected
@@ -47,6 +56,18 @@ _BASIC_REALM = 'Basic realm="DJ Art Engine"'
 _SUPPORT_PHONE = "+1 (603) 555-0000"
 _ORPHAN_AGE_SECONDS = 24 * 3600
 _PDF_THREAD_POOL_SIZE = 4
+
+# Rough per-call cost constants for the per-job cost-estimate log line.
+# Real numbers drift with provider pricing changes — these are good-enough
+# rounded values for an "is this job expensive?" alert, not billing.
+_COST_REPLICATE_UPSCALE = 0.005
+_COST_VECTORIZER_CREDIT = 0.20
+_COST_QC_HAIKU = 0.005
+_COST_QC_SONNET = 0.020
+_COST_QC_OPUS = 0.030
+
+# Bounding-box crop margin so we don't shave off the edge of the actual logo.
+_BBOX_MARGIN_FRACTION = 0.05
 
 
 class BasicAuthMiddleware(BaseHTTPMiddleware):
@@ -131,6 +152,33 @@ def _purge_orphan_jobs() -> None:
         log.info("Startup orphan cleanup: removed %s stale job dirs from %s.", purged, temp_root)
 
 
+def _estimate_qc_cost(model_used: str) -> float:
+    if not model_used:
+        return 0.0
+    lower = model_used.lower()
+    if "opus" in lower:
+        return _COST_QC_OPUS
+    if "sonnet" in lower:
+        return _COST_QC_SONNET
+    return _COST_QC_HAIKU
+
+
+def _crop_with_margin(image, bbox: tuple[int, int, int, int]):
+    """Crop with a margin so we don't slice through the edge of the logo."""
+    x1, y1, x2, y2 = bbox
+    w, h = image.size
+    bbox_w = x2 - x1
+    bbox_h = y2 - y1
+    mx = int(bbox_w * _BBOX_MARGIN_FRACTION)
+    my = int(bbox_h * _BBOX_MARGIN_FRACTION)
+    return image.crop((
+        max(0, x1 - mx),
+        max(0, y1 - my),
+        min(w, x2 + mx),
+        min(h, y2 + my),
+    ))
+
+
 @app.get("/")
 async def root() -> FileResponse:
     return FileResponse(str(INDEX_FILE), media_type="text/html")
@@ -197,8 +245,71 @@ async def process(
             package.cleanup(job_dir)
             raise HTTPException(status_code=exc.status, detail=exc.message) from exc
 
+        working_image = intake_result.image
+
+        # --- Upscale + QC in parallel (both fail open) ----------------------
+        # Both stages run against the post-intake image, so any bounding box
+        # Claude returns is in working_image coordinates. If upscale succeeds
+        # afterward, we rescale the bbox before cropping.
+        upscale_result, qc_verdict = await asyncio.gather(
+            upscale.maybe_upscale(working_image),
+            quality_check.assess(working_image),
+        )
+        upscaled_image, was_upscaled = upscale_result
+
+        log.info(
+            "Job %s intake size=%s low_res=%s upscaled=%s qc_model=%s qc_printable=%s",
+            job_id,
+            intake_result.original_size,
+            intake_result.low_resolution,
+            was_upscaled,
+            qc_verdict.model_used,
+            qc_verdict.printable,
+        )
+
+        # QC short-circuit BEFORE the Vectorizer.ai credit is spent. The 422
+        # body carries both dj_message and customer_ask so the frontend can
+        # render the actionable rejection screen.
+        if not qc_verdict.printable:
+            log.info(
+                "Job %s rejected by QC: category=%s reason=%r",
+                job_id, qc_verdict.verdict_category, qc_verdict.dj_message,
+            )
+            package.cleanup(job_dir)
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": qc_verdict.dj_message,
+                    "verdict_category": qc_verdict.verdict_category,
+                    "dj_message": qc_verdict.dj_message,
+                    "customer_ask": qc_verdict.customer_ask,
+                    "photopea_url": PHOTOPEA_FALLBACK_URL,
+                },
+            )
+
+        if was_upscaled:
+            working_image = upscaled_image
+
+        # Photo-of-object: crop to bbox so cleanup + vectorize only see the
+        # logo region. Bbox arrives in pre-upscale coords; rescale if needed.
+        if qc_verdict.is_photo_of_object and qc_verdict.logo_bbox:
+            bbox = qc_verdict.logo_bbox
+            if was_upscaled:
+                ow, oh = intake_result.image.size
+                nw, nh = working_image.size
+                if ow > 0 and oh > 0:
+                    sx, sy = nw / ow, nh / oh
+                    bbox = (
+                        int(bbox[0] * sx),
+                        int(bbox[1] * sy),
+                        int(bbox[2] * sx),
+                        int(bbox[3] * sy),
+                    )
+            working_image = _crop_with_margin(working_image, bbox)
+            log.info("Job %s cropped to logo bbox; new size=%s", job_id, working_image.size)
+
         # --- Pre-vectorization cleanup (PIL.Image -> PIL.Image, no JPEG hop)--
-        cleaned_image = cleanup.clean_image(intake_result.image)
+        cleaned_image = cleanup.clean_image(working_image)
         # Persist the cleaned image as PNG for debugging — lossless and matches
         # exactly what we send to Vectorizer.ai (after the single JPEG encode).
         cleaned_image.save(job_dir / "cleaned.png", format="PNG", optimize=True)
@@ -292,6 +403,33 @@ async def process(
             headers["X-Warning-StrokeOnly"] = "1"
         if intake_result.multipage_pdf:
             headers["X-Warning-MultiPage"] = "1"
+
+        if intake_result.low_resolution != "none":
+            ow, oh = intake_result.original_size
+            headers["X-Warning-LowResolution"] = f"{ow}x{oh}"
+        if was_upscaled:
+            uw, uh = working_image.size
+            headers["X-Stage-Upscaled"] = f"{uw}x{uh}"
+        elif (
+            upscale.should_upscale(intake_result.image.size)
+            and config.get_replicate_token()
+            and config.get_upscale_enabled()
+        ):
+            # Preconditions for upscale were met but it didn't happen — it failed.
+            headers["X-Warning-UpscaleSkipped"] = "1"
+        if qc_verdict.is_photo_of_object:
+            headers["X-Warning-PhotoOfObject"] = "1"
+        if qc_verdict.has_illegible_text:
+            headers["X-Warning-IllegibleText"] = "1"
+        if qc_verdict.model_used:
+            headers["X-QC-Model"] = qc_verdict.model_used
+
+        # Single per-job cost line — rough but useful for spotting runaway jobs.
+        cost = _COST_VECTORIZER_CREDIT
+        if was_upscaled:
+            cost += _COST_REPLICATE_UPSCALE
+        cost += _estimate_qc_cost(qc_verdict.model_used)
+        log.info("Job %s cost_estimate=$%.4f", job_id, cost)
 
         return FileResponse(
             path=str(zip_path),

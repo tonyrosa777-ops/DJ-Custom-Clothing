@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import logging
 from dataclasses import dataclass, field
+from typing import Literal
 
 import pillow_heif
 import pypdfium2 as pdfium
@@ -37,6 +38,8 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
 _PDF_RENDER_DPI = 150  # Vectorizer.ai doesn't need 300 DPI input — saves memory + time.
 _JPEG_QUALITY = 95
 _MAX_DIMENSION = 3000  # Cap raw input to bound RAM (Render free tier = 512 MB).
+_LOW_RES_HARD_PX = 500   # min(w,h) below this = loud warning, also triggers upscale
+_LOW_RES_SOFT_PX = 1000  # min(w,h) below this = polite warning, may trigger upscale
 
 
 @dataclass
@@ -54,6 +57,20 @@ class IntakeResult:
     image: Image.Image
     multipage_pdf: bool = False
     warnings: list[str] = field(default_factory=list)
+    # Pre-downscale dimensions of the source file. Surfaced to the frontend so
+    # DJ sees the customer's actual resolution, not the post-downscale value.
+    original_size: tuple[int, int] = (0, 0)
+    low_resolution: Literal["none", "soft", "hard"] = "none"
+
+
+def _classify_resolution(size: tuple[int, int]) -> Literal["none", "soft", "hard"]:
+    w, h = size
+    short_edge = min(w, h)
+    if short_edge < _LOW_RES_HARD_PX:
+        return "hard"
+    if short_edge < _LOW_RES_SOFT_PX:
+        return "soft"
+    return "none"
 
 
 def is_supported(content_type: str | None, filename: str | None) -> bool:
@@ -164,9 +181,15 @@ def decode(
         log.warning("EXIF orientation failed: %s", exc)
 
     image = _flatten_to_rgb(image)
+    original_size = image.size
     image = _maybe_downscale(image)
 
-    return IntakeResult(image=image, multipage_pdf=multipage_pdf)
+    return IntakeResult(
+        image=image,
+        multipage_pdf=multipage_pdf,
+        original_size=original_size,
+        low_resolution=_classify_resolution(original_size),
+    )
 
 
 def encode_jpeg(image: Image.Image) -> bytes:

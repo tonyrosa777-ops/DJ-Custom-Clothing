@@ -14,10 +14,18 @@ load_dotenv()
 
 _DEFAULT_MAX_FILE_MB = 20
 _DEFAULT_OUTPUT_DPI = 300
+_DEFAULT_QC_MODEL = "claude-haiku-4-5"
 
 
 def _env(key: str) -> str:
     return (os.environ.get(key) or "").strip()
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = _env(key).lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
 
 
 def get_api_credentials() -> tuple[str, str]:
@@ -59,6 +67,26 @@ def get_output_dpi() -> int:
         return int(raw)
     except ValueError:
         return _DEFAULT_OUTPUT_DPI
+
+
+def get_replicate_token() -> str:
+    """Return Replicate API token. Empty string = upscale stage disabled."""
+    return _env("REPLICATE_API_TOKEN")
+
+
+def get_anthropic_key() -> str:
+    """Return Anthropic API key. Empty string = quality-check stage disabled."""
+    return _env("ANTHROPIC_API_KEY")
+
+
+def get_qc_model() -> str:
+    """Claude model ID for the quality-check call. Default = Haiku 4.5."""
+    return _env("QC_MODEL") or _DEFAULT_QC_MODEL
+
+
+def get_upscale_enabled() -> bool:
+    """Kill-switch to skip Replicate calls without unsetting the token. Default: true."""
+    return _env_bool("UPSCALE_ENABLED", True)
 
 
 def get_temp_dir() -> Path:

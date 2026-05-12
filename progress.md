@@ -211,6 +211,110 @@ ANTHROPIC_API_KEY= # reserved — future quality-check feature
 
 ---
 
+## Bad-Input Bulletproofing (May 2026)
+
+A live test on 2026-05-11 surfaced the real-world failure mode: customer
+delivered a 158×150 px HEIC ("HCB Logo") — a thumbnail-sized file ~24× below
+print resolution. The pipeline ran cleanly and produced separation PDFs, but
+the source had no detail to recover. DJ confirmed this is typical — customers
+routinely send thumbnails, email-compressed JPEGs, and phone photos of
+existing shirts.
+
+This pass adds three pre-vectorize stages so the pipeline can (a) tell DJ when
+the input is too small, (b) automatically upscale low-resolution sources with
+AI super-resolution, and (c) get a second opinion from Claude vision on what's
+actually in the image before burning a Vectorizer.ai credit. It also adds a
+Claude-driven crop step for the "phone photo of a shirt" case, avoiding the
+need to host rembg's 170 MB model on Render's 512 MB free tier.
+
+### New pipeline shape
+```
+intake.decode (now captures original_size + low_resolution flag)
+    ↓
+[asyncio.gather]
+    ├── upscale.maybe_upscale  ← Replicate Real-ESRGAN if needed
+    └── quality_check.assess   ← Claude vision verdict
+    ↓
+QC verdict gates:
+    - printable=False → 422 short-circuit with {dj_message, customer_ask}
+    - photo_of_object + bbox → PIL crop before vectorize
+    ↓
+cleanup → vectorize → separate → export → package (unchanged)
+```
+
+### Failure UX contract
+Every rejection or warning must convert a dead-end into a forwardable email.
+The QC tool schema enforces two mandatory fields when an image is rejected:
+- **dj_message** — short, specific to *this* image (not boilerplate)
+- **customer_ask** — copy-pasteable sentence naming file types and a
+  resolution number
+
+The frontend renders the rejection as a dedicated panel with the dj_message
+as the banner, the customer_ask in a readonly `<textarea>`, and a one-click
+copy button — converting frustration into a 5-second customer email.
+
+### New modules
+- `pipeline/upscale.py` — direct httpx → Replicate Real-ESRGAN. Triggers only
+  when `long_edge < 1024 AND short_edge < 800`. Caps output at 2048 px long
+  edge. 45 s hard timeout. Fails open: any error returns the original image
+  unchanged. Avoids the replicate-python SDK due to its known httpx-Proxy
+  ImportError on Python 3.13+.
+- `pipeline/quality_check.py` — direct httpx → Anthropic Messages API with
+  tool-use schema enforcement. Default model `claude-haiku-4-5`. 20 s hard
+  timeout. Fails open: returns permissive default verdict on any error.
+  Downgrades unprintable verdicts to permissive when Claude returns empty
+  `dj_message`/`customer_ask` rather than show DJ an empty banner.
+
+### Extended modules
+- `pipeline/intake.py` — `IntakeResult` now carries `original_size` and a
+  `low_resolution: "none" | "soft" | "hard"` classification.
+- `pipeline/config.py` — new env getters: `get_replicate_token`,
+  `get_anthropic_key`, `get_qc_model`, `get_upscale_enabled`.
+- `main.py` — new orchestration block runs upscale+QC in parallel before
+  cleanup; 422 short-circuit body includes structured rejection fields;
+  bbox-based crop step for photo-of-object inputs; per-job
+  `cost_estimate=$0.0NNN` log line.
+- `static/index.html` — rejection panel with textarea + copy button;
+  info-banner style for `X-Stage-Upscaled`; new warning banners for
+  low-resolution, upscale-skipped, photo-of-object, and illegible-text.
+
+### New response headers
+| Header | Banner | Triggered by |
+|---|---|---|
+| `X-Warning-LowResolution` | yellow (with dims) | source `min(w,h) < 1000` |
+| `X-Stage-Upscaled` | blue (info) | Real-ESRGAN ran successfully |
+| `X-Warning-UpscaleSkipped` | yellow | upscale was attempted and failed |
+| `X-Warning-PhotoOfObject` | yellow | QC detected photo-of-object input |
+| `X-Warning-IllegibleText` | yellow | QC flagged unreadable small text |
+| `X-QC-Model` | (debug only) | model used for QC call |
+
+### New env vars
+```
+REPLICATE_API_TOKEN=         # required for AI upscaling
+ANTHROPIC_API_KEY=           # required for Claude vision QC
+QC_MODEL=claude-haiku-4-5    # override only if Haiku misclassifies
+UPSCALE_ENABLED=true         # kill-switch without unsetting the token
+```
+
+### Cost model
+| Stage | Service | Cost | When |
+|---|---|---|---|
+| Upscale | Replicate Real-ESRGAN | ~$0.005 | only when source < 1024×800 |
+| QC | Anthropic Haiku 4.5 | ~$0.001-0.005 | every job |
+| Vectorize | Vectorizer.ai | 1 credit (~$0.20) | every job that passes QC |
+
+Worst-case low-res job: ~$0.21. Typical job: ~$0.20-0.205.
+At 100 jobs/month, marginal cost over the previous pipeline: ~$1/month.
+
+### Explicitly deferred
+- LAB k-means quantization (re-evaluate if upscaled photos still hit `complex_design`)
+- vtracer local fallback (only if Vectorizer.ai outages become a real failure mode)
+- BRISQUE/NIQE numerical quality (Claude QC is a superset; add only for analytics)
+- rembg (replaced by Claude bbox + PIL crop; revisit only if bbox misclassifies)
+- Vectorizer.ai parameter tuning per QC verdict (cheap follow-up spike)
+
+---
+
 ## Notes & Decisions Log
 
 | Date | Decision | Reason |

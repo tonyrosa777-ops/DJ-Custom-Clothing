@@ -11,3 +11,11 @@ venv/
 .vscode/
 .claude/
 .playwright-mcp/
+
+# Local test artifacts
+server.log
+test-output/
+test-output.zip
+test-headers.txt
+white-test.zip
+white-headers.txt

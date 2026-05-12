@@ -224,8 +224,62 @@
     }
     .banner.active { display: block; }
     .banner.warning { background: var(--warning-bg); border: 1px solid var(--warning); color: var(--warning); }
+    .banner.info { background: rgba(58, 162, 255, 0.1); border: 1px solid #3aa2ff; color: #3aa2ff; }
     .banner.error { background: var(--danger-bg); border: 1px solid var(--danger); color: var(--danger); }
     .banner a { color: inherit; font-weight: 600; }
+
+    .rejection-panel { display: none; border-left: 4px solid var(--danger); }
+    .rejection-panel.active { display: block; }
+    .rejection-header {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 15px; font-weight: 600; color: var(--danger);
+      margin-bottom: 16px;
+    }
+    .rejection-header .icon { font-size: 18px; }
+    .customer-ask-label {
+      display: block;
+      font-size: 13px; color: var(--text-dim); font-weight: 500;
+      margin-bottom: 6px;
+    }
+    #customerAskText {
+      width: 100%;
+      min-height: 96px;
+      background: #0f1218;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+      padding: 12px;
+      font-family: inherit;
+      resize: vertical;
+    }
+    #customerAskText:focus { outline: none; border-color: var(--accent); }
+    .rejection-actions {
+      display: flex; gap: 8px; margin-top: 12px;
+    }
+    button.secondary {
+      flex: 0 0 auto;
+      padding: 12px 16px;
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    button.secondary:hover { border-color: var(--accent); background: rgba(255,122,26,0.05); }
+    .rejection-actions .primary { flex: 1; margin-top: 0; }
+    .rejection-fallback {
+      margin-top: 14px;
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+    .rejection-fallback a { color: var(--text-dim); }
+    .rejection-fallback a:hover { color: var(--accent); }
+    .copy-confirm { color: var(--success); font-weight: 600; margin-left: 8px; font-size: 13px; }
 
     footer {
       text-align: center;
@@ -244,6 +298,7 @@
 
     <div id="errorBanner" class="banner error"></div>
     <div id="warningBanner" class="banner warning"></div>
+    <div id="infoBanner" class="banner info"></div>
 
     <section id="uploadPanel" class="panel">
       <div id="dropzone" class="dropzone" tabindex="0">
@@ -287,6 +342,22 @@
       <button id="downloadBtn" class="primary">Download ZIP</button>
     </section>
 
+    <section id="rejectionPanel" class="panel rejection-panel">
+      <div class="rejection-header">
+        <span class="icon">!</span>
+        <span id="rejectionMessage"></span>
+      </div>
+      <label class="customer-ask-label" for="customerAskText">Copy and send this to the customer:</label>
+      <textarea id="customerAskText" readonly></textarea>
+      <div class="rejection-actions">
+        <button id="copyCustomerAsk" class="primary">Copy to clipboard<span id="copyConfirm" class="copy-confirm" style="display:none;">Copied</span></button>
+        <button id="tryAnotherBtn" class="secondary">Try a different file</button>
+      </div>
+      <div class="rejection-fallback">
+        Stuck? <a href="https://www.photopea.com/" target="_blank" rel="noopener">Edit manually in Photopea →</a>
+      </div>
+    </section>
+
     <footer>Built by Optimus Business Solutions</footer>
   </main>
 
@@ -308,6 +379,14 @@
     const downloadBtn = $("downloadBtn");
     const errorBanner = $("errorBanner");
     const warningBanner = $("warningBanner");
+    const infoBanner = $("infoBanner");
+    const uploadPanel = $("uploadPanel");
+    const rejectionPanel = $("rejectionPanel");
+    const rejectionMessage = $("rejectionMessage");
+    const customerAskText = $("customerAskText");
+    const copyCustomerAsk = $("copyCustomerAsk");
+    const copyConfirm = $("copyConfirm");
+    const tryAnotherBtn = $("tryAnotherBtn");
 
     const MAX_SIZE_MB = 20;
     const ACCEPTED_TYPES = [
@@ -372,15 +451,36 @@
     function clearBanners() {
       errorBanner.classList.remove("active");
       warningBanner.classList.remove("active");
+      infoBanner.classList.remove("active");
+      rejectionPanel.classList.remove("active");
+      copyConfirm.style.display = "none";
     }
     function showError(message, photopeaUrl) {
-      errorBanner.innerHTML = message +
-        (photopeaUrl ? ` <a href="${photopeaUrl}" target="_blank" rel="noopener">Open in Photopea →</a>` : "");
+      errorBanner.innerHTML = escapeHtml(message) +
+        (photopeaUrl ? ` <a href="${escapeHtml(photopeaUrl)}" target="_blank" rel="noopener">Open in Photopea →</a>` : "");
       errorBanner.classList.add("active");
     }
     function showWarning(message) {
       warningBanner.textContent = message;
       warningBanner.classList.add("active");
+    }
+    function showInfo(message) {
+      infoBanner.textContent = message;
+      infoBanner.classList.add("active");
+    }
+    function showRejection(djMessage, customerAsk) {
+      // textContent is intentional: defends against any HTML in server-generated
+      // messages, and the textarea naturally treats its value as plain text.
+      rejectionMessage.textContent = djMessage || "This image cannot be processed.";
+      customerAskText.value = customerAsk || "";
+      rejectionPanel.classList.add("active");
+      uploadPanel.style.display = "none";
+    }
+    function resetToUpload() {
+      clearBanners();
+      resultPanel.classList.remove("active");
+      uploadPanel.style.display = "";
+      clearFile();
     }
 
     let progressStartTime = 0;
@@ -420,9 +520,26 @@
       if (headers.get("X-Warning-StrokeOnly") === "1") {
         messages.push("Logo only had outlines (no fills) — stroke colors were used as the separation list.");
       }
+      const lowRes = headers.get("X-Warning-LowResolution");
+      if (lowRes) {
+        messages.push(`Source image is ${lowRes}px. Output detail will be limited by source resolution. For best results, ask the customer for a file at least 2000×2000 pixels.`);
+      }
+      if (headers.get("X-Warning-UpscaleSkipped") === "1") {
+        messages.push("AI upscale failed; using original source. Output detail will be limited.");
+      }
+      if (headers.get("X-Warning-PhotoOfObject") === "1") {
+        messages.push("Detected a photo of an object — the logo was auto-cropped. Verify the color preview before clicking download.");
+      }
+      if (headers.get("X-Warning-IllegibleText") === "1") {
+        messages.push("Small text in this logo may not burn legibly at print size.");
+      }
       if (messages.length) {
         warningBanner.innerHTML = messages.map(escapeHtml).join("<br>");
         warningBanner.classList.add("active");
+      }
+      const upscaled = headers.get("X-Stage-Upscaled");
+      if (upscaled) {
+        showInfo(`Low-resolution source — automatically upscaled with AI to ${upscaled}px before vectorizing.`);
       }
     }
 
@@ -443,6 +560,14 @@
         if (!response.ok) {
           let errorJson = null;
           try { errorJson = await response.json(); } catch (e) {}
+          // 422 with customer_ask = QC rejection. Show the actionable panel
+          // (customer-ask textarea + copy button) instead of a flat banner.
+          if (response.status === 422 && errorJson && errorJson.customer_ask) {
+            showRejection(errorJson.dj_message || errorJson.error, errorJson.customer_ask);
+            stopProgress();
+            processBtn.disabled = false;
+            return;
+          }
           const msg = (errorJson && (errorJson.detail || errorJson.error)) ||
                       `Request failed (${response.status})`;
           const photopea = errorJson && errorJson.photopea_url;
@@ -529,6 +654,21 @@
     clearBtn.addEventListener("click", (e) => { e.stopPropagation(); clearFile(); });
     processBtn.addEventListener("click", process);
     downloadBtn.addEventListener("click", triggerDownload);
+    tryAnotherBtn.addEventListener("click", resetToUpload);
+    copyCustomerAsk.addEventListener("click", async () => {
+      const text = customerAskText.value;
+      if (!text) return;
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (e) {
+        // Fallback for non-secure contexts: select + execCommand
+        customerAskText.focus();
+        customerAskText.select();
+        try { document.execCommand("copy"); } catch (_) {}
+      }
+      copyConfirm.style.display = "inline";
+      setTimeout(() => { copyConfirm.style.display = "none"; }, 2000);
+    });
   </script>
 </body>
 </html>
