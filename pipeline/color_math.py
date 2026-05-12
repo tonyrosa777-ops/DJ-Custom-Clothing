@@ -12,7 +12,10 @@ import math
 
 WHITE_HEX = "#FFFFFF"
 _NEAR_WHITE_THRESHOLD = 10.0
-_MATCH_THRESHOLD = 15.0
+# Match threshold for screen-printing separation: at ΔE 15 the rendering misses
+# paths that were grouped together by the dedupe step. ΔE 25 keeps cluster
+# members on the same film and tracks the dedupe threshold in separate.py.
+_MATCH_THRESHOLD = 25.0
 
 # Named color palette for coarse hex-to-name lookup.
 _NAMED_COLORS: dict[str, str] = {

@@ -348,6 +348,11 @@ async def process(
                 },
             )
 
+        # Collapse gradient fills to a single representative hex before anything
+        # downstream sees the SVG — otherwise gradient regions silently drop out
+        # of the color separations. Lossy by design (see separate._representative_hex).
+        svg_bytes = separate.resolve_gradient_refs(svg_bytes)
+
         (job_dir / "vectorized.svg").write_bytes(svg_bytes)
         # Vectorizer already has the SVG — drop the upload buffer.
         del jpeg_bytes

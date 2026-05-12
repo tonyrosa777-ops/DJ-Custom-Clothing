@@ -10,6 +10,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+import cv2  # opencv-python-headless — used for LAB-space k-means consolidation
 import numpy as np
 from lxml import etree
 from svgpathtools import parse_path
@@ -18,6 +19,7 @@ from pipeline import color_math
 from pipeline.color_math import (
     colors_match,
     delta_e_hex,
+    hex_to_rgb,
     is_near_white,
     name_color,
     normalize_hex,
@@ -25,12 +27,29 @@ from pipeline.color_math import (
 
 log = logging.getLogger(__name__)
 
-_DEDUPE_THRESHOLD = 10.0
+# Dedup grouping for screen-printing separations. At ΔE 10 we get fragmented
+# films from anti-aliasing pixels Vectorizer.ai traces along color boundaries —
+# cotton + ink can't reproduce ΔE 10 differences anyway. ΔE 25 is the industry
+# threshold for "noticeably different in printed work."
+_DEDUPE_THRESHOLD = 25.0
+# Background filtering stays tight — we don't want to over-aggressively delete
+# logo paths just because they're vaguely near the canvas background color.
+_BACKGROUND_MATCH_THRESHOLD = 10.0
+# Hard cap on number of films emitted. Screen-printing presses run 4-8 color
+# jobs; even a perfectly-deduplicated palette can exceed this on shaded
+# illustrations. When it does, we collapse to k=8 via LAB-space k-means.
+_MAX_PRINT_COLORS = 8
+# Cap path-count weight in k-means sample expansion so a single high-coverage
+# color can't balloon the LAB array into a memory issue.
+_KMEANS_WEIGHT_CAP = 100
 _COVERAGE_DPI = 72
 _BACKGROUND_COVERAGE_RATIO = 0.98  # bbox area / viewBox area required to call something "background"
 _STYLE_FILL_RE = re.compile(r"fill\s*:\s*(#[0-9a-fA-F]{3,6}|none|[a-zA-Z]+)")
 _STYLE_STROKE_RE = re.compile(r"stroke\s*:\s*(#[0-9a-fA-F]{3,6}|none|[a-zA-Z]+)")
 _GRADIENT_REF_RE = re.compile(r"url\(\s*#[^)]+\)", re.IGNORECASE)
+# Capture group variant — used by resolve_gradient_refs to pull the gradient id.
+_GRADIENT_REF_ID_RE = re.compile(r"url\(\s*#([^)]+?)\s*\)", re.IGNORECASE)
+_STYLE_STOP_COLOR_RE = re.compile(r"stop-color\s*:\s*([^;]+)", re.IGNORECASE)
 _SVG_NS = "http://www.w3.org/2000/svg"
 
 
@@ -102,6 +121,130 @@ def _has_gradient_paint(element) -> bool:
     if _GRADIENT_REF_RE.search(style):
         return True
     return False
+
+
+def _extract_gradient_stops(gradient_element) -> list[str]:
+    """Pull #RRGGBB stop colors from <stop> children of a gradient element.
+
+    Skips named CSS colors and stops without a stop-color (rare in Vectorizer.ai
+    output but defensive). Returns the stops in document order — preserves the
+    gradient's progression for callers that want first/last/mid stop.
+    """
+    stops: list[str] = []
+    for child in gradient_element.iter():
+        if not isinstance(child.tag, str):
+            continue
+        if etree.QName(child).localname != "stop":
+            continue
+        sc = child.get("stop-color")
+        if not sc:
+            style = child.get("style") or ""
+            m = _STYLE_STOP_COLOR_RE.search(style)
+            if m:
+                sc = m.group(1).strip()
+        norm = normalize_hex(sc) if sc else None
+        if norm:
+            stops.append(norm)
+    return stops
+
+
+def _representative_hex(stops: list[str]) -> str | None:
+    """Collapse a gradient's stops to a single representative hex via RGB midpoint.
+
+    LOSSY BY DESIGN: a yellow-to-orange gradient becomes a single mid-orange.
+    The printed film will look slightly different from any individual pixel of
+    the source gradient. This is intentional — screen-printing presses cannot
+    reproduce gradients on a single screen anyway, so a flat representative
+    color is what the press will actually print. If you (future-reader) are
+    wondering why the rendered orange looks "off" from the source: it's not
+    a bug, it's the design.
+    """
+    if not stops:
+        return None
+    if len(stops) == 1:
+        return stops[0]
+    rs, gs, bs = zip(*[hex_to_rgb(s) for s in stops])
+    return "#{:02X}{:02X}{:02X}".format(
+        sum(rs) // len(rs),
+        sum(gs) // len(gs),
+        sum(bs) // len(bs),
+    )
+
+
+def _build_gradient_index(root) -> dict[str, str]:
+    """Walk the SVG and return {gradient_id: representative_hex} for every
+    <linearGradient>/<radialGradient> with a parseable id and at least one
+    valid hex stop. Gradients with no valid stops are omitted; references to
+    them will remain unresolved and the path will drop out of the films via
+    the existing fallback (which is the correct conservative behavior)."""
+    index: dict[str, str] = {}
+    for element in root.iter():
+        if not isinstance(element.tag, str):
+            continue
+        local = etree.QName(element).localname
+        if local not in ("linearGradient", "radialGradient"):
+            continue
+        gid = element.get("id")
+        if not gid:
+            continue
+        stops = _extract_gradient_stops(element)
+        rep = _representative_hex(stops)
+        if rep:
+            index[gid] = rep
+    return index
+
+
+def resolve_gradient_refs(svg_bytes: bytes) -> bytes:
+    """Rewrite fill='url(#X)' / stroke='url(#X)' references to a solid hex.
+
+    LOSSY BY DESIGN — see _representative_hex for the why. The output SVG has
+    no gradient references on paintable elements; each gradient region now
+    looks like a solid-color region to the rest of the pipeline. This is what
+    lets the separation logic actually produce a film for that region (the
+    previous behavior dropped gradient regions entirely).
+
+    Returns the modified SVG bytes. If the SVG has no gradients or fails to
+    parse, returns the original bytes unchanged so the caller can continue.
+    """
+    try:
+        root = etree.fromstring(svg_bytes)
+    except etree.XMLSyntaxError:
+        return svg_bytes
+
+    index = _build_gradient_index(root)
+    if not index:
+        return svg_bytes
+
+    rewrites = 0
+    for element in root.iter():
+        if not isinstance(element.tag, str):
+            continue
+        for attr in ("fill", "stroke"):
+            val = element.get(attr)
+            if not val:
+                continue
+            m = _GRADIENT_REF_ID_RE.search(val)
+            if m and m.group(1) in index:
+                element.set(attr, index[m.group(1)])
+                rewrites += 1
+        style = element.get("style")
+        if style:
+            new_style = style
+            for gid, rep in index.items():
+                new_style = re.sub(
+                    rf"url\(\s*#{re.escape(gid)}\s*\)",
+                    rep,
+                    new_style,
+                )
+            if new_style != style:
+                element.set("style", new_style)
+                rewrites += 1
+
+    log.info(
+        "Resolved %s gradient definitions, %s paintable references rewritten.",
+        len(index), rewrites,
+    )
+    return etree.tostring(root, xml_declaration=True, encoding="utf-8")
 
 
 _SKIPPED_TAGS = frozenset({"defs", "clipPath", "mask", "style", "metadata", "title", "desc"})
@@ -225,6 +368,78 @@ def _dedupe_colors(hex_list: list[str]) -> dict[str, str]:
     return mapping
 
 
+def _kmeans_consolidate(canonical_counts: dict[str, int], k: int) -> dict[str, int]:
+    """Cap a {hex: count} map at k colors via LAB-space k-means.
+
+    Weights each input color by its path count (capped at _KMEANS_WEIGHT_CAP)
+    so high-coverage colors dominate cluster placement. Returns a new
+    {representative_hex: total_count} map.
+
+    Representative selection within each cluster — deterministic three-key sort:
+      1. Highest path count wins.
+      2. If counts tie, closest to cluster centroid (smallest ΔE in LAB) wins.
+      3. If still tied (very rare), lexicographic smallest hex wins.
+
+    The render match runs at _MATCH_THRESHOLD (ΔE 25), wider than any expected
+    cluster radius, so each cluster representative captures the cluster's full
+    membership at render time. The representative choice only affects the
+    film's display name (e.g., 'Brown_8B5A3C' vs 'Brown_8C5B3D'), not which
+    paths land on the film.
+    """
+    if len(canonical_counts) <= k:
+        return canonical_counts
+
+    hexes = list(canonical_counts.keys())
+    counts = np.array(list(canonical_counts.values()), dtype=np.int32)
+    lab_array = np.array(
+        [color_math.hex_to_lab(h) for h in hexes],
+        dtype=np.float32,
+    )
+
+    # Expand by capped weight so high-coverage colors pull centroids harder.
+    weights = np.minimum(counts, _KMEANS_WEIGHT_CAP).astype(np.int32)
+    weights = np.maximum(weights, 1)  # guard against zero-weight rows
+    expanded_lab = np.repeat(lab_array, weights, axis=0)
+    expanded_idx = np.repeat(np.arange(len(hexes)), weights)
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.5)
+    _compactness, labels, centers = cv2.kmeans(
+        expanded_lab, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS,
+    )
+    labels = labels.flatten()
+
+    # Map each original hex to its dominant cluster (majority of expanded samples).
+    orig_to_cluster: dict[int, int] = {}
+    for orig_idx in range(len(hexes)):
+        mask = expanded_idx == orig_idx
+        if not mask.any():
+            continue
+        orig_to_cluster[orig_idx] = int(np.bincount(labels[mask]).argmax())
+
+    # Group originals by cluster, tracking each member's distance to its centroid.
+    cluster_members: dict[int, list[tuple[str, int, float]]] = {}
+    for orig_idx, cluster_idx in orig_to_cluster.items():
+        center = centers[cluster_idx]
+        delta_to_center = float(np.linalg.norm(lab_array[orig_idx] - center))
+        cluster_members.setdefault(cluster_idx, []).append(
+            (hexes[orig_idx], int(counts[orig_idx]), delta_to_center)
+        )
+
+    # Three-key sort: (-count, distance_to_center, hex). Highest count first; ties
+    # broken by proximity to centroid; final ties by lex order for determinism.
+    new_counts: dict[str, int] = {}
+    for members in cluster_members.values():
+        members.sort(key=lambda m: (-m[1], m[2], m[0]))
+        rep_hex = members[0][0]
+        new_counts[rep_hex] = sum(c for _, c, _ in members)
+
+    log.info(
+        "K-means consolidated %s colors -> %s (k=%s).",
+        len(hexes), len(new_counts), k,
+    )
+    return new_counts
+
+
 # Sentinel used by _compute_coverage to flag a render that crashed.
 COVERAGE_ERROR_SENTINEL: float = -1.0
 
@@ -291,7 +506,7 @@ def _filter_color_pool(
 
     filtered: dict[str, int] = {}
     for hex_value, count in canonical.items():
-        if background_hex and colors_match(hex_value, background_hex, threshold=_DEDUPE_THRESHOLD):
+        if background_hex and colors_match(hex_value, background_hex, threshold=_BACKGROUND_MATCH_THRESHOLD):
             continue
         if is_near_white(hex_value) and not dark_background:
             continue
@@ -329,6 +544,13 @@ def extract_colors(svg_bytes: bytes) -> SeparationResult:
         color_pool = filtered_strokes
         stroke_only_fallback = True
         log.info("Falling back to stroke colors (no fills detected after filtering).")
+
+    # Hard cap on film count for screen-printability. Dedupe alone can leave
+    # 10-15 distinct colors on complex shaded illustrations; k-means collapses
+    # to 8 by clustering in LAB space. No-op when dedupe already brought us
+    # below the cap.
+    if len(color_pool) > _MAX_PRINT_COLORS:
+        color_pool = _kmeans_consolidate(color_pool, _MAX_PRINT_COLORS)
 
     # Coverage computation reuses the parsed root — no re-parsing N+1 times.
     coverage_by_hex = _compute_coverage(root, list(color_pool.keys()))
