@@ -35,10 +35,11 @@
       padding: 24px 16px;
       position: relative;
       overflow-x: hidden;
-      /* The photo sits beneath everything; ::before adds a darkening + vignette
-         overlay so the bright zones don't fight the panel UI. */
+      /* The photo sits beneath everything; ::before adds a light darkening
+         overlay only behind the header so the bright sky doesn't fight
+         the title. The rest of the photo breathes. */
       background:
-        url('/static/background-photo.jpg') center/cover no-repeat fixed,
+        url('/static/background-photo.jpg') center 25%/cover no-repeat fixed,
         #0a0c10;
     }
     body::before {
@@ -48,10 +49,8 @@
       pointer-events: none;
       z-index: 0;
       background:
-        /* Soft vignette: pushes focus toward the center, darkens corners. */
-        radial-gradient(ellipse at center, transparent 35%, rgba(8, 10, 14, 0.55) 100%),
-        /* Gentle top-to-bottom darken so the bright sky doesn't blow out the header. */
-        linear-gradient(180deg, rgba(8, 10, 14, 0.45) 0%, rgba(8, 10, 14, 0.25) 35%, rgba(8, 10, 14, 0.55) 100%);
+        /* Light vignette: very subtle edge fade, no corner darkening. */
+        radial-gradient(ellipse at center, transparent 55%, rgba(8, 10, 14, 0.25) 100%);
     }
     /* Sit the UI above the overlay. */
     main { position: relative; z-index: 1; }
