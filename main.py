@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import logging
 import secrets
 import shutil
@@ -55,7 +56,7 @@ _AUTH_EXEMPT_PATHS = ("/health",)
 _BASIC_REALM = 'Basic realm="DJ Art Engine"'
 _SUPPORT_PHONE = "+1 (603) 555-0000"
 _ORPHAN_AGE_SECONDS = 24 * 3600
-_PDF_THREAD_POOL_SIZE = 4
+_PDF_THREAD_POOL_SIZE = 2
 
 # Rough per-call cost constants for the per-job cost-estimate log line.
 # Real numbers drift with provider pricing changes — these are good-enough
@@ -247,29 +248,16 @@ async def process(
 
         working_image = intake_result.image
 
-        # --- Upscale + QC in parallel (both fail open) ----------------------
-        # Both stages run against the post-intake image, so any bounding box
-        # Claude returns is in working_image coordinates. If upscale succeeds
-        # afterward, we rescale the bbox before cropping.
-        upscale_result, qc_verdict = await asyncio.gather(
-            upscale.maybe_upscale(working_image),
-            quality_check.assess(working_image),
-        )
-        upscaled_image, was_upscaled = upscale_result
+        # --- QC first (cheap, decides whether to spend on upscale/Vectorizer) ---
+        # Serialized (not parallel) so peak memory holds only one heavy stage
+        # at a time — required to fit inside Render's 512 MB free-tier ceiling.
+        # QC ordered first: a screenshot/non-logo upload short-circuits before
+        # we burn a Replicate upscale call or a Vectorizer.ai credit.
+        qc_verdict = await quality_check.assess(working_image)
 
-        log.info(
-            "Job %s intake size=%s low_res=%s upscaled=%s qc_model=%s qc_printable=%s",
-            job_id,
-            intake_result.original_size,
-            intake_result.low_resolution,
-            was_upscaled,
-            qc_verdict.model_used,
-            qc_verdict.printable,
-        )
-
-        # QC short-circuit BEFORE the Vectorizer.ai credit is spent. The 422
-        # body carries both dj_message and customer_ask so the frontend can
-        # render the actionable rejection screen.
+        # QC short-circuit BEFORE upscale and Vectorizer credits are spent.
+        # The 422 body carries both dj_message and customer_ask so the
+        # frontend can render the actionable rejection screen.
         if not qc_verdict.printable:
             log.info(
                 "Job %s rejected by QC: category=%s reason=%r",
@@ -287,15 +275,35 @@ async def process(
                 },
             )
 
+        # --- Upscale only if QC passed ---------------------------------------
+        # Captured here because the QC bounding box is in pre-upscale coords;
+        # we rescale below if the upscale fires.
+        pre_upscale_size = working_image.size
+        upscaled_image, was_upscaled = await upscale.maybe_upscale(working_image)
+
+        log.info(
+            "Job %s intake size=%s low_res=%s upscaled=%s qc_model=%s qc_printable=%s",
+            job_id,
+            intake_result.original_size,
+            intake_result.low_resolution,
+            was_upscaled,
+            qc_verdict.model_used,
+            qc_verdict.printable,
+        )
+
         if was_upscaled:
             working_image = upscaled_image
+            # Original PIL.Image is no longer referenced anywhere we care about
+            # — drop the dataclass slot so GC can reclaim the pre-upscale buffer.
+            intake_result.image = None  # type: ignore[assignment]
+            gc.collect()
 
         # Photo-of-object: crop to bbox so cleanup + vectorize only see the
         # logo region. Bbox arrives in pre-upscale coords; rescale if needed.
         if qc_verdict.is_photo_of_object and qc_verdict.logo_bbox:
             bbox = qc_verdict.logo_bbox
             if was_upscaled:
-                ow, oh = intake_result.image.size
+                ow, oh = pre_upscale_size
                 nw, nh = working_image.size
                 if ow > 0 and oh > 0:
                     sx, sy = nw / ow, nh / oh
@@ -317,6 +325,9 @@ async def process(
         # --- Encode JPEG ONCE, immediately before the API call ---------------
         jpeg_bytes = intake.encode_jpeg(cleaned_image)
         (job_dir / "vectorize_input.jpg").write_bytes(jpeg_bytes)
+        # Pixel buffer no longer needed — JPEG bytes are what we send.
+        del cleaned_image
+        gc.collect()
 
         # --- Vectorize --------------------------------------------------------
         try:
@@ -338,6 +349,9 @@ async def process(
             )
 
         (job_dir / "vectorized.svg").write_bytes(svg_bytes)
+        # Vectorizer already has the SVG — drop the upload buffer.
+        del jpeg_bytes
+        gc.collect()
 
         # --- Separate colors --------------------------------------------------
         try:
@@ -411,7 +425,7 @@ async def process(
             uw, uh = working_image.size
             headers["X-Stage-Upscaled"] = f"{uw}x{uh}"
         elif (
-            upscale.should_upscale(intake_result.image.size)
+            upscale.should_upscale(pre_upscale_size)
             and config.get_replicate_token()
             and config.get_upscale_enabled()
         ):

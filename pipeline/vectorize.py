@@ -122,8 +122,12 @@ async def vectorize(image_bytes: bytes, filename: str, content_type: str) -> byt
             raise VectorizerError(status=502, message=last_error_message)
 
         if 500 <= status < 600:
-            log.warning("Vectorizer.ai %s on attempt %s — retrying.", status, attempt)
-            last_error_message = f"Vectorizer.ai server error {status}"
+            body_snippet = response.text[:500] if response.text else "(empty body)"
+            log.warning(
+                "Vectorizer.ai %s on attempt %s — retrying. body=%s",
+                status, attempt, body_snippet,
+            )
+            last_error_message = f"Vectorizer.ai server error {status}: {body_snippet}"
             if attempt < _MAX_ATTEMPTS:
                 await asyncio.sleep(_BACKOFF_SCHEDULE[attempt - 1])
                 continue

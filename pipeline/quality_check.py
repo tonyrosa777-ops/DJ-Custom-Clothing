@@ -197,6 +197,9 @@ async def assess(image: Image.Image) -> QualityVerdict:
     Fail-open contract: never raises. On any error, missing credentials, or
     unparseable response, returns the permissive default verdict and logs.
     """
+    if not config.get_qc_enabled():
+        return _PERMISSIVE_DEFAULT
+
     api_key = config.get_anthropic_key()
     if not api_key:
         return _PERMISSIVE_DEFAULT

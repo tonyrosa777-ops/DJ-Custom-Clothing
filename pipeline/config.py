@@ -89,6 +89,16 @@ def get_upscale_enabled() -> bool:
     return _env_bool("UPSCALE_ENABLED", True)
 
 
+def get_qc_enabled() -> bool:
+    """Kill-switch to skip Claude vision QC without unsetting the API key. Default: true.
+
+    Flip to false (Render env var) as a memory panic switch — drops the QC
+    base64 image buffer from the per-request peak. Pipeline still produces
+    valid ZIPs without QC; it just loses the smart rejection layer.
+    """
+    return _env_bool("QC_ENABLED", True)
+
+
 def get_temp_dir() -> Path:
     """Resolve temp dir. Falls back to system temp if env value is unset or unwritable."""
     raw = _env("TEMP_DIR")
