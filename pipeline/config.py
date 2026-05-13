@@ -15,6 +15,10 @@ load_dotenv()
 _DEFAULT_MAX_FILE_MB = 20
 _DEFAULT_OUTPUT_DPI = 300
 _DEFAULT_QC_MODEL = "claude-haiku-4-5"
+# 6 is the screen-printing sweet spot: enough for a brand mark with an accent
+# color, few enough to keep film count manageable. 0 = unlimited (legacy
+# Vectorizer.ai behavior — produces gradient fragmentation).
+_DEFAULT_VECTORIZE_MAX_COLORS = 6
 
 
 def _env(key: str) -> str:
@@ -67,6 +71,28 @@ def get_output_dpi() -> int:
         return int(raw)
     except ValueError:
         return _DEFAULT_OUTPUT_DPI
+
+
+def get_vectorize_max_colors() -> int:
+    """Cap on distinct fill colors in Vectorizer.ai's SVG output.
+
+    Maps directly to Vectorizer.ai's `processing.max_colors` API param.
+    Setting this tells the API to quantize INTERNALLY before path tracing
+    — the architectural fix for "gradient explodes into many films" and
+    "low-saturation grays merged into the white background" symptoms.
+
+    Set VECTORIZE_MAX_COLORS=0 to disable (let Vectorizer pick — legacy
+    behavior, produces the fragmentation we shipped this cap to fix).
+    Valid range is 0-256 (API limit); values outside clamp to the bounds.
+    """
+    raw = _env("VECTORIZE_MAX_COLORS")
+    if not raw:
+        return _DEFAULT_VECTORIZE_MAX_COLORS
+    try:
+        v = int(raw)
+        return max(0, min(v, 256))
+    except ValueError:
+        return _DEFAULT_VECTORIZE_MAX_COLORS
 
 
 def get_replicate_token() -> str:

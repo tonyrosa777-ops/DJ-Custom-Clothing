@@ -81,9 +81,30 @@ async def vectorize(image_bytes: bytes, filename: str, content_type: str) -> byt
 
     files = {"image": (filename, image_bytes, content_type or "application/octet-stream")}
     mode = config.get_vectorizer_mode()
-    data = {"mode": mode, "output.file_format": "svg"}
+    max_colors = config.get_vectorize_max_colors()
+    # Tell Vectorizer.ai to quantize internally before tracing — this is the
+    # architectural fix for "gradient splits into multiple films" and
+    # "low-saturation grays merged into background." Cheaper than fighting
+    # the output downstream with our own k-means.
+    #   processing.max_colors — cap on distinct fills (0 disables; default 6)
+    #   processing.shapes.min_area_px — drop anti-aliasing speckle paths
+    #   output.group_by — pre-group paths by ink color for cleaner SVG parsing
+    #   output.shape_stacking — screen-print-friendly stacking (vs cutouts)
+    data: dict[str, str] = {
+        "mode": mode,
+        "output.file_format": "svg",
+        "processing.shapes.min_area_px": "2.0",
+        "output.group_by": "color",
+        "output.shape_stacking": "stacked",
+    }
+    if max_colors > 0:
+        data["processing.max_colors"] = str(max_colors)
     if mode != "production":
         log.info("Vectorizer.ai mode=%s (set VECTORIZER_MODE=production for clean output).", mode)
+    log.info(
+        "Vectorizer.ai request: mode=%s max_colors=%s",
+        mode, max_colors if max_colors > 0 else "unlimited",
+    )
 
     last_error_message = "unknown error"
     for attempt in range(1, _MAX_ATTEMPTS + 1):
